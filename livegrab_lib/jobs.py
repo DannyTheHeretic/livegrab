@@ -1,8 +1,11 @@
 """In-memory grab jobs, persisted to jobs.json.
 
-On POSIX, yt-dlp is spawned in its own session. Stop sends SIGTERM only to
-a process this app created. A PID Livegrab did not spawn is never signaled,
-including an already-running external grab.
+On POSIX, yt-dlp is spawned in its own session so Stop can signal ffmpeg
+with it. Stop sends SIGINT to that group first, waits briefly so yt-dlp can
+finish a partial file, then SIGKILL if the group is still alive. A PID
+Livegrab did not spawn is never signaled, including an already-running
+external grab. On Windows, Stop breaks the hidden process group when that
+does not open a console, then ``taskkill /F /T`` removes whatever remains.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +36,13 @@ ACTIVE_STATES = {"starting", "downloading", "merging", "external"}
 RUNNING_STATES = {"starting", "downloading", "merging"}
 # Historical pid. Never signal it.
 NEVER_SIGNAL_PIDS = {149396}
+# POSIX stop: let yt-dlp finish a partial file, then force the group down.
+_POSIX_STOP_GRACE = 2.0
+_POSIX_STOP_POLL = 0.1
+_POSIX_STOP_KILL_WAIT = 1.0
+# Windows stop: same grace after a hidden break, then always taskkill the tree.
+_WINDOWS_STOP_GRACE = 2.0
+_WINDOWS_STOP_POLL = 0.1
 FOLDER_REQUIRED = "Choose a folder before starting"
 FOLDER_UNCREATABLE = "Could not create that folder"
 
@@ -771,7 +782,7 @@ class JobManager:
         return snapshot
 
     def stop_job(self, job_id: str):
-        """SIGTERM the process group only when this process spawned it."""
+        """Stop a grab this process spawned. Leave every other pid alone."""
         with self._lock:
             job = self._find(job_id)
             if job is None:
@@ -784,9 +795,9 @@ class JobManager:
             if not self._safe_to_signal(pid, job.get("url") or ""):
                 return 409, {"error": "Livegrab will not stop a download it did not start"}
             self._stop_requested.add(job_id)
-            job["state"] = "interrupted"
+            job["state"] = "stopped"
+            _remember_output(job)
             self._save_locked()
-            snapshot = public_job(job)
         if pid in NEVER_SIGNAL_PIDS:
             return 409, {"error": "Livegrab will not stop a download it did not start"}
         try:
@@ -794,8 +805,21 @@ class JobManager:
         except ProcessLookupError:
             pass
         except (PermissionError, OSError):
+            with self._lock:
+                self._stop_requested.discard(job_id)
+                job = self._find(job_id)
+                if job is not None and job.get("state") == "stopped" and pid_alive(pid):
+                    job["state"] = "downloading"
+                    self._save_locked()
             return 409, {"error": "Livegrab will not stop a download it did not start"}
-        return 200, snapshot
+        with self._lock:
+            job = self._find(job_id)
+            if job is None:
+                return 404, {"error": "job not found"}
+            job["state"] = "stopped"
+            _remember_output(job)
+            self._save_locked()
+            return 200, public_job(job)
 
     def _safe_to_signal(self, pid, url: str) -> bool:
         try:
@@ -868,6 +892,9 @@ class JobManager:
                     self._on_line(job_id, list(tail), parse_progress_line(text))
         finally:
             rc = proc.wait()
+            stream = proc.stdout
+            if stream is not None:
+                stream.close()
             self._on_exit(job_id, rc)
 
     def _on_line(self, job_id: str, tail: list[str], parsed) -> None:
@@ -881,7 +908,7 @@ class JobManager:
             self._save_locked()
 
     def _apply_progress(self, job: dict, parsed: dict) -> None:
-        if job.get("state") in ("finished", "interrupted", "external"):
+        if job.get("state") in ("finished", "interrupted", "stopped", "external"):
             return
         phase = parsed.get("phase")
         if phase == "downloading":
@@ -901,6 +928,7 @@ class JobManager:
                 "finished",
                 "error",
                 "interrupted",
+                "stopped",
                 "external",
             ):
                 self._hard_merged.add(job["id"])
@@ -917,7 +945,9 @@ class JobManager:
             pid = job.get("pid")
             if isinstance(pid, int):
                 self._spawned.discard(pid)
-            if job_id in self._stop_requested or (isinstance(rc, int) and rc < 0):
+            if job_id in self._stop_requested:
+                job["state"] = "stopped"
+            elif isinstance(rc, int) and rc < 0:
                 job["state"] = "interrupted"
             elif rc == 0 and job.get("state") != "error":
                 job["state"] = "finished"
@@ -925,6 +955,7 @@ class JobManager:
                 job["state"] = "error"
                 if not job.get("error"):
                     job["error"] = f"yt-dlp exited with status {rc}"
+            _remember_output(job)
             self._save_locked()
 
     def _load(self) -> None:
@@ -967,7 +998,12 @@ class JobManager:
 
 
 def _popen_kwargs() -> dict:
-    """Argv spawn options. shell stays off. A new session is POSIX-only."""
+    """Argv spawn options.
+
+    ``shell`` stays off, so POSIX does not open a terminal. A new session
+    is POSIX-only and lets Stop signal yt-dlp and its children together.
+    Windows console flags come from ``subprocess_kwargs``.
+    """
     kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
@@ -985,12 +1021,197 @@ def _popen_kwargs() -> dict:
 
 
 def _signal_spawned(pid: int) -> None:
-    """SIGTERM a process this app spawned. On POSIX, signal its session."""
+    """Stop a process this app spawned.
+
+    Windows hides the console, breaks that process group when it can do so
+    without opening a window, then ``taskkill /F /T`` removes the parent and
+    every child that is still recording. POSIX sends SIGINT to its session so
+    yt-dlp can finish a partial file, waits briefly, then SIGKILL the group
+    if anything is still alive.
+    """
     number = int(pid)
+    if number in NEVER_SIGNAL_PIDS or number <= 0:
+        raise PermissionError("refusing to signal this pid")
     if sys.platform == "win32":
-        os.kill(number, signal.SIGTERM)
+        _signal_spawned_windows(number)
         return
-    os.killpg(number, signal.SIGTERM)
+    _signal_spawned_posix(number)
+
+
+def _signal_spawned_windows(pid: int) -> None:
+    """Kill a Windows yt-dlp tree without opening a cmd window.
+
+    ``os.kill(..., SIGTERM)`` ends only the parent. The ffmpeg or sleeper
+    child keeps recording. A break is attempted first, and only through the
+    process that was already started hidden. Then ``taskkill /F /T /PID``
+    force-kills that pid and its descendants. The parent is still the
+    taskkill target when the break could not be delivered, which is the
+    usual case with ``CREATE_NO_WINDOW``.
+    """
+    if _windows_ctrl_break(pid):
+        _wait_pid_exit(pid, _WINDOWS_STOP_GRACE)
+    _windows_taskkill_tree(pid)
+
+
+def _windows_ctrl_break(pid: int) -> bool:
+    """Send CTRL_BREAK to a hidden process group. Never creates a console."""
+    event = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if event is None or pid in NEVER_SIGNAL_PIDS or pid <= 0:
+        return False
+    try:
+        os.kill(pid, event)
+    except OSError:
+        return False
+    return True
+
+
+def _windows_taskkill_tree(pid: int) -> None:
+    """``taskkill /F /T /PID``. The window for taskkill itself stays hidden."""
+    number = int(pid)
+    if number in NEVER_SIGNAL_PIDS or number <= 0:
+        raise PermissionError("refusing to signal this pid")
+    command = ["taskkill", "/F", "/T", "/PID", str(number)]
+    kwargs = subprocess_kwargs()
+    kwargs["stdin"] = subprocess.DEVNULL
+    kwargs["stdout"] = subprocess.DEVNULL
+    kwargs["stderr"] = subprocess.DEVNULL
+    kwargs["shell"] = False
+    kwargs["check"] = False
+    subprocess.run(command, **kwargs)
+
+
+def _wait_pid_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if not pid_alive(pid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_WINDOWS_STOP_POLL, remaining))
+
+
+def _signal_spawned_posix(pid: int) -> None:
+    _kill_process_group(pid, signal.SIGINT)
+    if _wait_for_group_exit(pid, _POSIX_STOP_GRACE):
+        return
+    _kill_process_group(pid, signal.SIGKILL)
+    _wait_for_group_exit(pid, _POSIX_STOP_KILL_WAIT)
+
+
+def _kill_process_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return
+
+
+def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if not _group_has_live_members(pgid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_POSIX_STOP_POLL, remaining))
+
+
+def _group_has_live_members(pgid: int) -> bool:
+    """True when a non-zombie process still belongs to ``pgid``."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pid_alive(pgid)
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        fields = _proc_stat_fields(int(entry))
+        if fields is None:
+            continue
+        state, pgrp = fields
+        if pgrp == pgid and state != "Z":
+            return True
+    return False
+
+
+def _proc_stat_fields(pid: int):
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            stat = handle.read()
+    except OSError:
+        return None
+    end = stat.rfind(")")
+    if end < 0:
+        return None
+    tail = stat[end + 1 :].split()
+    if len(tail) < 4:
+        return None
+    try:
+        pgrp = int(tail[2])
+    except ValueError:
+        return None
+    return tail[0], pgrp
+
+
+def _remember_output(job: dict) -> None:
+    found = _locate_output(job)
+    if found:
+        job["output_path"] = found
+
+
+def _locate_output(job: dict) -> str | None:
+    """Return a recording path that exists. Do not delete the file."""
+    recorded = job.get("output_path")
+    if isinstance(recorded, str) and recorded.strip():
+        recorded_path = recorded.strip()
+        if os.path.isfile(recorded_path):
+            return recorded_path
+        part = recorded_path if recorded_path.endswith(".part") else recorded_path + ".part"
+        if os.path.isfile(part):
+            return part
+        if recorded_path.endswith(".part"):
+            finished = recorded_path[: -len(".part")]
+            if finished and os.path.isfile(finished):
+                return finished
+    destination = job.get("destination")
+    if not isinstance(destination, str) or not destination.strip():
+        return None
+    folder = Path(destination)
+    try:
+        entries = [entry for entry in folder.iterdir() if entry.is_file()]
+    except OSError:
+        return None
+    started = _started_timestamp(job.get("started_at"))
+    fresh = []
+    for entry in entries:
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if started is not None and mtime < started - 2:
+            continue
+        if started is None and not entry.name.endswith(".part"):
+            continue
+        fresh.append((mtime, entry))
+    if not fresh:
+        return None
+    parts = [item for item in fresh if item[1].name.endswith(".part")]
+    pool = parts or fresh
+    pool.sort(key=lambda item: item[0])
+    return str(pool[-1][1])
+
+
+def _started_timestamp(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _resolve_folder(value, fallback) -> str:

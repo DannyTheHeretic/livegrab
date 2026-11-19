@@ -71,6 +71,29 @@ class ParseProgressLineTests(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertEqual(result.get("phase"), "merging")
 
+    def test_ffmpeg_stats_are_downloading(self):
+        line = (
+            "frame=  480 fps= 40 q=-1.0 size=    8960KiB time=00:00:15.93 "
+            "bitrate=4606.8kbits/s speed=1.33x elapsed=0:00:12.00"
+        )
+        self.assert_fields(
+            line,
+            stream="video",
+            phase="downloading",
+            size="8960KiB",
+            speed="4606.8kbits/s",
+        )
+
+    def test_ffmpeg_stats_ignore_na_metrics(self):
+        line = "frame=    0 fps=0.0 q=-1.0 size=       0KiB time=N/A bitrate=N/A speed=N/A"
+        self.assert_fields(
+            line,
+            stream="video",
+            phase="downloading",
+            size="0KiB",
+            speed=None,
+        )
+
     def test_remux_line_is_merging(self):
         result = parse_progress_line("[VideoRemuxer] remux into mp4")
         self.assertIsInstance(result, dict)

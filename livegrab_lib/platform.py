@@ -83,17 +83,48 @@ def ffprobe_path() -> str | None:
     return find_tool(["ffprobe", "ffprobe.exe"])
 
 
+# Win32 constants. Python only defines the subprocess names on Windows,
+# so the numeric values keep unit tests able to inspect the same flags.
+_WIN_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+_WIN_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_WIN_STARTF_USESHOWWINDOW = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+_WIN_SW_HIDE = getattr(subprocess, "SW_HIDE", 0)
+
+
 def subprocess_kwargs() -> dict:
     """Return extra subprocess arguments for the current platform.
 
-    On Windows, include ``creationflags`` set to ``CREATE_NO_WINDOW`` when
-    that attribute exists. Otherwise return an empty dict.
+    On Windows, hide the child console. ``CREATE_NO_WINDOW`` keeps yt-dlp
+    and a console taskkill from opening a cmd window. ``SW_HIDE`` covers
+    the startup info those processes still honor. ``CREATE_NEW_PROCESS_GROUP``
+    lets a later break signal target that group when a console exists.
+    It does not create a window. Other platforms get an empty dict.
     """
-    if sys.platform == "win32":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", None)
-        if creationflags is not None:
-            return {"creationflags": creationflags}
-    return {}
+    if sys.platform != "win32":
+        return {}
+    startupinfo = _hidden_startupinfo()
+    flags = _WIN_CREATE_NO_WINDOW | _WIN_CREATE_NEW_PROCESS_GROUP
+    return {"startupinfo": startupinfo, "creationflags": flags}
+
+
+def _hidden_startupinfo():
+    """STARTUPINFO that asks Windows not to show a new console window."""
+    cls = getattr(subprocess, "STARTUPINFO", None)
+    if cls is None:
+        info = _FallbackStartupInfo()
+    else:
+        info = cls()
+    info.dwFlags |= _WIN_STARTF_USESHOWWINDOW
+    info.wShowWindow = _WIN_SW_HIDE
+    return info
+
+
+class _FallbackStartupInfo:
+    """Stand-in used when this interpreter has no ``subprocess.STARTUPINFO``."""
+
+    def __init__(self):
+        self.dwFlags = 0
+        self.wShowWindow = 0
 
 
 def _program_dirs() -> list[Path]:

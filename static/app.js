@@ -24,6 +24,7 @@
   var saveTimer = null;
   var saveGeneration = 0;
   var jobsRequest = 0;
+  var jobList = [];
   var followsRequest = 0;
   var hydrating = true;
   var jobsLoaded = false;
@@ -42,14 +43,16 @@
     live: "Starts from now.",
     rewind: "Starts from the beginning."
   };
-  var STOPPABLE = { starting: true, downloading: true, merging: true };
+  var AUDIO_LABELS = {
+    live: "Live player audio",
+    rewind: "From the start"
+  };
+  var ACTIVE = { starting: true, downloading: true, merging: true, running: true };
   var STATE_LABELS = {
-    starting: "Starting",
-    downloading: "Downloading",
-    merging: "Merging",
-    finished: "Finished",
+    running: "Running",
+    stopped: "Stopped",
     error: "Error",
-    interrupted: "Interrupted",
+    finished: "Finished",
     external: "External"
   };
 
@@ -270,9 +273,150 @@
     return parts.length ? parts.join(" · ") : "—";
   }
 
+  function progressObject(job) {
+    if (!job || typeof job.progress !== "object" || job.progress === null || Array.isArray(job.progress)) {
+      return {};
+    }
+    return job.progress;
+  }
+
+  function progressEmpty(progress) {
+    var keys = Object.keys(progress || {});
+    if (!keys.length) return true;
+    for (var i = 0; i < keys.length; i++) {
+      if (known(progress[keys[i]]) && typeof progress[keys[i]] !== "object") return false;
+    }
+    return true;
+  }
+
+  function fieldValue(job, key) {
+    if (job && known(job[key])) return job[key];
+    var progress = progressObject(job);
+    if (known(progress[key])) return progress[key];
+    return job ? job[key] : undefined;
+  }
+
+  function isJobPayload(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    return known(data.id) || known(data.url) || known(data.state) || known(data.status);
+  }
+
+  function normalizeJob(raw) {
+    if (!isJobPayload(raw)) return null;
+    var progress = progressObject(raw);
+    var video = raw.video && typeof raw.video === "object" ? raw.video : progress.video;
+    var audio = raw.audio && typeof raw.audio === "object" ? raw.audio : progress.audio;
+    return {
+      id: raw.id,
+      url: fieldValue(raw, "url"),
+      destination: fieldValue(raw, "destination"),
+      template: fieldValue(raw, "template"),
+      live_from_start: known(raw.live_from_start) ? raw.live_from_start : progress.live_from_start,
+      audio_source: fieldValue(raw, "audio_source"),
+      state: known(raw.state) ? raw.state : (known(raw.status) ? raw.status : progress.state),
+      status: known(raw.status) ? raw.status : progress.status,
+      owner: known(raw.owner) ? raw.owner : progress.owner,
+      size: fieldValue(raw, "size"),
+      speed: fieldValue(raw, "speed"),
+      fragment: fieldValue(raw, "fragment"),
+      fragment_total: fieldValue(raw, "fragment_total"),
+      percent: fieldValue(raw, "percent"),
+      video: video && typeof video === "object" ? video : null,
+      audio: audio && typeof audio === "object" ? audio : null,
+      log_tail: Array.isArray(raw.log_tail) ? raw.log_tail : [],
+      output_path: fieldValue(raw, "output_path"),
+      error: fieldValue(raw, "error"),
+      started_at: fieldValue(raw, "started_at"),
+      progress: progress
+    };
+  }
+
+  function displayStatus(job) {
+    var state = job && known(job.state) ? String(job.state).toLowerCase() : "";
+    var status = job && known(job.status) ? String(job.status).toLowerCase() : "";
+    if (state === "error" || status === "error") return "error";
+    if (state === "stopped" || state === "interrupted" || status === "stopped" || status === "interrupted") return "stopped";
+    if (state === "finished" || status === "finished") return "finished";
+    if (state === "external" || status === "external" || (job && job.owner === "external")) return "external";
+    if (ACTIVE[state] || ACTIVE[status] || status === "running" || state === "running") return "running";
+    if (status) return status;
+    if (state) return state;
+    return "running";
+  }
+
+  function statusText(status) {
+    if (STATE_LABELS[status]) return STATE_LABELS[status];
+    if (!status) return "Running";
+    return status.charAt(0).toUpperCase() + status.slice(1);
+  }
+
+  function audioLabel(job) {
+    var source = job && known(job.audio_source) ? String(job.audio_source) : "";
+    if (!AUDIO_LABELS[source]) source = job && job.live_from_start === false ? "live" : "rewind";
+    return AUDIO_LABELS[source];
+  }
+
+  function mergeJob(prev, next) {
+    var merged = {};
+    var key;
+    for (key in prev) {
+      if (Object.prototype.hasOwnProperty.call(prev, key)) merged[key] = prev[key];
+    }
+    for (key in next) {
+      if (Object.prototype.hasOwnProperty.call(next, key)) merged[key] = next[key];
+    }
+    ["url", "destination", "audio_source", "template", "size", "speed", "fragment", "fragment_total", "percent", "output_path", "started_at", "owner"].forEach(function (name) {
+      if (!known(next[name]) && known(prev[name])) merged[name] = prev[name];
+    });
+    if (!known(next.state) && known(prev.state)) merged.state = prev.state;
+    if (!known(next.status) && known(prev.status)) merged.status = prev.status;
+    if (!known(next.live_from_start) && known(prev.live_from_start)) merged.live_from_start = prev.live_from_start;
+    if (!streamHasDetail(next.video) && streamHasDetail(prev.video)) merged.video = prev.video;
+    if (!streamHasDetail(next.audio) && streamHasDetail(prev.audio)) merged.audio = prev.audio;
+    if (progressEmpty(next.progress) && !progressEmpty(prev.progress)) merged.progress = prev.progress;
+    if (!Array.isArray(next.log_tail) || !next.log_tail.length) {
+      if (Array.isArray(prev.log_tail) && prev.log_tail.length) merged.log_tail = prev.log_tail;
+    }
+    return merged;
+  }
+
+  function upsertJob(raw) {
+    var job = normalizeJob(raw);
+    if (!job) return;
+    var id = known(job.id) ? String(job.id) : "";
+    if (!id) {
+      jobList.unshift(job);
+      return;
+    }
+    for (var i = 0; i < jobList.length; i++) {
+      if (String(jobList[i].id) === id) {
+        jobList[i] = mergeJob(jobList[i], job);
+        return;
+      }
+    }
+    jobList.unshift(job);
+  }
+
+  function applyServerJobs(incoming) {
+    var prior = {};
+    jobList.forEach(function (job) {
+      if (known(job.id)) prior[String(job.id)] = job;
+    });
+    var next = [];
+    incoming.forEach(function (raw) {
+      var job = normalizeJob(raw);
+      if (!job) return;
+      if (known(job.id) && prior[String(job.id)]) job = mergeJob(prior[String(job.id)], job);
+      next.push(job);
+    });
+    jobList = next;
+  }
+
   function renderJob(job) {
     var card = document.createElement("article");
     card.className = "job";
+    var status = displayStatus(job);
+    card.dataset.status = status;
 
     var head = document.createElement("div");
     head.className = "job-head";
@@ -282,14 +426,20 @@
     title.textContent = known(job.url) ? String(job.url) : "Untitled grab";
 
     var state = document.createElement("p");
-    var stateName = known(job.state) ? String(job.state) : "unknown";
-    state.className = "job-state state-" + stateName;
-    state.textContent = STATE_LABELS[stateName] || stateName;
+    state.className = "job-state state-" + status;
+    state.textContent = statusText(status);
 
     head.append(title, state);
     card.appendChild(head);
 
-    if (job.owner === "external") {
+    var choice = document.createElement("p");
+    choice.className = "job-choice";
+    choice.textContent = audioLabel(job);
+    card.appendChild(choice);
+
+    appendLabeled(card, "job-detail", "Folder", known(job.destination) ? String(job.destination) : "—");
+
+    if (job.owner === "external" || status === "external") {
       var note = document.createElement("p");
       note.className = "elsewhere";
       note.textContent = "Already downloading elsewhere";
@@ -317,8 +467,8 @@
       appendLabeled(card, "stream", "Audio", streamText(job.audio));
     }
 
-    if (stateName === "finished" && known(job.output_path)) {
-      appendLabeled(card, "output", "Saved", String(job.output_path));
+    if (known(job.output_path)) {
+      appendLabeled(card, "output", status === "finished" ? "Saved" : "Output", String(job.output_path));
     }
 
     if (known(job.error)) {
@@ -335,7 +485,7 @@
       card.appendChild(log);
     }
 
-    if (job.owner === "livegrab" && STOPPABLE[stateName]) {
+    if (job.owner === "livegrab" && status === "running") {
       var stop = document.createElement("button");
       stop.type = "button";
       stop.className = "stop";
@@ -357,18 +507,40 @@
       var response = await fetch("/api/jobs/" + encodeURIComponent(id) + "/stop", {
         method: "POST"
       });
+      var payload = null;
+      try {
+        payload = await response.json();
+      } catch (parseErr) {
+        payload = null;
+      }
       if (!response.ok) {
-        var message = await readMessage(response);
+        var message = payload && known(payload.error) ? String(payload.error) : "";
         setStatus(message || "Could not stop that grab.", "error");
-        button.disabled = false;
-        button.textContent = "Stop";
+        if (button.isConnected) {
+          button.disabled = false;
+          button.textContent = "Stop";
+        }
         return;
       }
-      await refreshJobs();
+      if (isJobPayload(payload)) {
+        upsertJob(payload);
+        paintJobs();
+      }
+      try {
+        await refreshJobs();
+      } catch (refreshErr) {
+        if (!jobList.length) showJobsMessage("Jobs are not available yet.");
+      }
+      if (button.isConnected) {
+        button.disabled = false;
+        button.textContent = "Stop";
+      }
     } catch (err) {
       setStatus("Could not stop that grab.", "error");
-      button.disabled = false;
-      button.textContent = "Stop";
+      if (button.isConnected) {
+        button.disabled = false;
+        button.textContent = "Stop";
+      }
     }
   }
 
@@ -379,6 +551,24 @@
     jobsEl.replaceChildren(empty);
   }
 
+  function paintJobs() {
+    if (!jobList.length) {
+      showJobsMessage("No grabs yet.");
+      return;
+    }
+    var visible = jobList.slice().sort(function (a, b) {
+      var left = known(a.started_at) ? String(a.started_at) : "";
+      var right = known(b.started_at) ? String(b.started_at) : "";
+      if (left === right) return 0;
+      return left < right ? 1 : -1;
+    });
+    var fragment = document.createDocumentFragment();
+    visible.forEach(function (job) {
+      fragment.appendChild(renderJob(job));
+    });
+    jobsEl.replaceChildren(fragment);
+  }
+
   async function refreshJobs() {
     var request = ++jobsRequest;
     var response = await fetch("/api/jobs");
@@ -386,23 +576,10 @@
     if (!response.ok) throw new Error("jobs");
     var data = await response.json();
     if (request !== jobsRequest) return;
-    var jobs = Array.isArray(data.jobs) ? data.jobs.slice() : [];
+    var incoming = data && Array.isArray(data.jobs) ? data.jobs : [];
     jobsLoaded = true;
-    if (!jobs.length) {
-      showJobsMessage("No grabs yet.");
-      return;
-    }
-    jobs.sort(function (a, b) {
-      var left = known(a.started_at) ? String(a.started_at) : "";
-      var right = known(b.started_at) ? String(b.started_at) : "";
-      if (left === right) return 0;
-      return left < right ? 1 : -1;
-    });
-    var fragment = document.createDocumentFragment();
-    jobs.forEach(function (job) {
-      fragment.appendChild(renderJob(job));
-    });
-    jobsEl.replaceChildren(fragment);
+    applyServerJobs(incoming);
+    paintJobs();
   }
 
   function followLabel(follow) {
@@ -621,16 +798,26 @@
       } catch (parseErr) {
         job = null;
       }
-      if (job && job.state === "error") {
-        setStatus(known(job.error) ? String(job.error) : "Could not start the grab.", "error");
-      } else if (job && (job.state === "external" || job.owner === "external")) {
+      if (isJobPayload(job)) {
+        upsertJob(job);
+        paintJobs();
+      }
+      var started = normalizeJob(job);
+      var startedStatus = started ? displayStatus(started) : "";
+      if (startedStatus === "error") {
+        setStatus(started && known(started.error) ? String(started.error) : "Could not start the grab.", "error");
+      } else if (startedStatus === "external") {
         urlInput.value = "";
         setStatus("Already downloading elsewhere.");
       } else {
         urlInput.value = "";
         setStatus("Grab started.");
       }
-      await refreshJobs();
+      try {
+        await refreshJobs();
+      } catch (refreshErr) {
+        if (!jobList.length) showJobsMessage("Jobs are not available yet.");
+      }
     } catch (err) {
       setStatus("Could not start the grab.", "error");
     } finally {
@@ -683,7 +870,7 @@
     }
     setInterval(function () {
       refreshJobs().catch(function () {
-        if (!jobsLoaded) showJobsMessage("Jobs are not available yet.");
+        if (!jobsLoaded && !jobList.length) showJobsMessage("Jobs are not available yet.");
       });
     }, 2000);
     setInterval(function () {

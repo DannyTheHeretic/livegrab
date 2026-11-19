@@ -14,19 +14,19 @@ jobs:
     name: Create or update release
     runs-on: ubuntu-latest
     steps:
-      - name: Create v0.1.0 release if missing
+      - name: Create v0.1.1 release if missing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          if gh release view v0.1.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release v0.1.0 already exists. Installer jobs replace its assets."
+          if gh release view v0.1.1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v0.1.1 already exists. Installer jobs replace its assets."
           else
-            gh release create v0.1.0 \
+            gh release create v0.1.1 \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "v0.1.0" \
-              --notes "Windows setup Livegrab-Setup.exe includes Livegrab, yt-dlp, and ffmpeg. Debian package livegrab_0.1.0_all.deb depends on python3, ffmpeg, and yt-dlp."
+              --title "v0.1.1" \
+              --notes "Windows setup Livegrab-Setup.exe includes Livegrab, yt-dlp, and ffmpeg. Debian package livegrab_0.1.1_all.deb depends on python3, ffmpeg, and yt-dlp."
           fi
 
   windows:
@@ -111,7 +111,7 @@ jobs:
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          gh release upload v0.1.0 --clobber --repo "$env:GITHUB_REPOSITORY" "packaging\build\output\Livegrab-Setup.exe"
+          gh release upload v0.1.1 --clobber --repo "$env:GITHUB_REPOSITORY" "packaging\build\output\Livegrab-Setup.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   ubuntu:
@@ -126,7 +126,7 @@ jobs:
         run: |
           set -eu
           sh packaging/build-deb.sh
-          depends=$(dpkg-deb -f dist/livegrab_0.1.0_all.deb Depends)
+          depends=$(dpkg-deb -f dist/livegrab_0.1.1_all.deb Depends)
           echo "Depends: $depends"
           for pkg in python3 ffmpeg yt-dlp; do
             if ! printf '%s\n' "$depends" | grep -Eq "(^|,)[[:space:]]*${pkg}([[:space:]]|,|\\(|$)"; then
@@ -142,4 +142,4 @@ jobs:
       - name: Upload Debian package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload v0.1.0 --clobber --repo "$GITHUB_REPOSITORY" dist/livegrab_0.1.0_all.deb
+        run: gh release upload v0.1.1 --clobber --repo "$GITHUB_REPOSITORY" dist/livegrab_0.1.1_all.deb

@@ -4,7 +4,7 @@
 ; Compile with ISCC.exe packaging\livegrab.iss
 
 #define MyAppName "Livegrab"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #define MyAppExeName "Livegrab.exe"
 
 [Setup]

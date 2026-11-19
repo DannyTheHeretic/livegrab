@@ -367,12 +367,23 @@ code {
   white-space: nowrap;
 }
 
+.job-state.state-running,
+.job-state.state-finished {
+  color: var(--accent);
+}
+
+.job-state.state-stopped {
+  color: var(--muted);
+}
+
 .job-state.state-error,
 .job-state.state-interrupted {
   color: var(--danger);
 }
 
 .job-meta,
+.job-choice,
+.job-detail,
 .stream,
 .output,
 .elsewhere,
@@ -383,7 +394,7 @@ code {
 
 .stream-label {
   display: inline-block;
-  min-width: 3.4rem;
+  min-width: 4.6rem;
   margin-right: 0.4rem;
   color: var(--muted);
   font-weight: 650;
