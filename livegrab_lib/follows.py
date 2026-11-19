@@ -20,11 +20,11 @@ import threading
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from livegrab_lib.command import DEFAULT_YTDLP
-from livegrab_lib.config import CONFIG_DIR, load_config
+from livegrab_lib.config import load_config
 from livegrab_lib.jobs import ACTIVE_STATES, JobError, pid_alive
+from livegrab_lib.platform import config_dir, subprocess_kwargs, ytdlp_path
 
-FOLLOWS_PATH = os.path.join(CONFIG_DIR, "follows.json")
+FOLLOWS_PATH = config_dir() / "follows.json"
 CHECK_INTERVAL_SECONDS = 180
 STARTUP_DELAY_SECONDS = 5
 
@@ -139,14 +139,19 @@ def check_follows(follows, probe, start=None, active=None):
 
 
 def probe_args(login: str) -> list[str]:
-    """Argv for a metadata check. No download flags and no --live-from-start."""
+    """Argv for a metadata check.
+
+    No download flags and no --live-from-start. ``--no-js-runtimes`` keeps
+    the check from launching a JavaScript runtime.
+    """
     url = channel_url(login.strip().lower())
     args = [
-        DEFAULT_YTDLP,
+        ytdlp_path(),
         "--no-download",
         "--no-update",
         "--no-warnings",
         "--ignore-no-formats-error",
+        "--no-js-runtimes",
         "--dump-single-json",
         url,
     ]
@@ -164,15 +169,17 @@ def probe_channel(login: str, timeout: float = 60) -> dict:
     args = probe_args(login)
     directory = tempfile.mkdtemp(prefix="livegrab-probe-")
     try:
-        completed = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            cwd=directory,
-            check=False,
-        )
+        run_kwargs = {
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+            "stdin": subprocess.DEVNULL,
+            "cwd": directory,
+            "check": False,
+        }
+        run_kwargs.update(subprocess_kwargs())
+        run_kwargs["shell"] = False
+        completed = subprocess.run(args, **run_kwargs)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "live check timed out"}
     except OSError as exc:
@@ -184,7 +191,8 @@ def probe_channel(login: str, timeout: float = 60) -> dict:
 
 class FollowStore:
     def __init__(self, path: str = FOLLOWS_PATH):
-        self.path = path
+        # The default path is a pathlib.Path. Later saves concatenate a suffix.
+        self.path = os.fspath(path)
         self._lock = threading.Lock()
         self._follows: list[dict] = []
         self._load()

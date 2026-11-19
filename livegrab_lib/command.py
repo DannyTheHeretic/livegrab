@@ -2,14 +2,22 @@
 
 This module never executes yt-dlp. Callers that spawn a process must keep
 the result as an argv list and must not pass it through a shell.
+
+Livegrab is Python only. ``--no-js-runtimes`` clears yt-dlp's default
+JavaScript runtimes so a grab does not launch one.
 """
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
-DEFAULT_YTDLP = "/usr/bin/yt-dlp"
-DEFAULT_NODE = "/home/random/.local/bin/node"
+from livegrab_lib.platform import ffmpeg_path as platform_ffmpeg_path
+from livegrab_lib.platform import ytdlp_path as platform_ytdlp_path
+
+# Resolved when this module is imported. Not a fixed install path.
+DEFAULT_YTDLP = platform_ytdlp_path()
+# Kept so existing callers can still import the name. Never a runtime path.
+DEFAULT_NODE = None
 
 
 def wants_live_from_start(choice) -> bool:
@@ -33,28 +41,25 @@ def build_args(
     destination,
     template,
     live_from_start,
-    ytdlp_path=DEFAULT_YTDLP,
-    node_path=DEFAULT_NODE,
+    ytdlp_path=None,
+    node_path=None,
 ):
     """Return the argv for one grab.
 
-    ``--live-from-start`` is added only for the rewind choice. JavaScript
-    runtime flags are omitted when node_path is missing or is not an
-    existing file. Nothing is downloaded here.
+    ``--live-from-start`` is added only for the rewind choice.
+    ``--no-js-runtimes`` is always set. When ffmpeg is found, its directory
+    is passed as ``--ffmpeg-location``. ``node_path`` is accepted and
+    ignored so older callers keep working; it is never placed on argv.
+    Nothing is downloaded here.
     """
-    ytdlp = ytdlp_path or DEFAULT_YTDLP
-    args = [ytdlp, "--newline", "--no-update"]
+    del node_path
+    binary = ytdlp_path or platform_ytdlp_path()
+    args = [binary, "--newline", "--no-update", "--no-js-runtimes"]
+    ffmpeg = platform_ffmpeg_path()
+    if ffmpeg:
+        args.extend(["--ffmpeg-location", str(Path(ffmpeg).parent)])
     if wants_live_from_start(live_from_start):
         args.append("--live-from-start")
-    if node_path and os.path.isfile(node_path):
-        args.extend(
-            [
-                "--js-runtimes",
-                "node:" + node_path,
-                "--remote-components",
-                "ejs:github",
-            ]
-        )
-    output = os.path.join(destination, template)
+    output = str(Path(destination) / template)
     args.extend(["--remux-video", "mp4", "-o", output, url])
     return args

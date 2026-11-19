@@ -5,10 +5,10 @@
   var form = document.getElementById("grab-form");
   var startBtn = document.getElementById("start");
   var destinationInput = document.getElementById("destination");
+  var destinationNeeded = document.getElementById("destination-needed");
   var templateInput = document.getElementById("template");
   var audioHelp = document.getElementById("audio-help");
   var audioConsequence = document.getElementById("audio-consequence");
-  var destinationChoices = document.getElementById("destination-choices");
   var templatePresets = document.getElementById("template-presets");
   var templateExact = document.getElementById("template-exact");
   var settingsNote = document.getElementById("settings-note");
@@ -20,9 +20,11 @@
   var followStatus = document.getElementById("follow-status");
   var followsEl = document.getElementById("follows");
 
-  var choices = [];
   var presets = {};
   var saveTimer = null;
+  var saveGeneration = 0;
+  var jobsRequest = 0;
+  var followsRequest = 0;
   var hydrating = true;
   var jobsLoaded = false;
   var followsStamp = "";
@@ -67,8 +69,48 @@
     else delete settingsNote.dataset.kind;
   }
 
+  function destinationValue() {
+    return destinationInput.value.trim();
+  }
+
+  function destinationFromServer(data) {
+    if (!data || !known(data.destination)) return "";
+    return String(data.destination).trim();
+  }
+
+  function syncDestinationNeeded() {
+    if (destinationValue()) {
+      destinationNeeded.hidden = true;
+      return;
+    }
+    destinationNeeded.hidden = false;
+    if (destinationNeeded.dataset.kind !== "error") {
+      destinationNeeded.textContent = "Choose a folder before starting.";
+    }
+  }
+
+  function showFolderError(message) {
+    if (!message) return;
+    var text = String(message);
+    var lower = text.toLowerCase();
+    if (lower.indexOf("destination") === -1 && lower.indexOf("folder") === -1) return;
+    if (!destinationValue()) {
+      syncDestinationNeeded();
+      return;
+    }
+    destinationNeeded.hidden = false;
+    destinationNeeded.dataset.kind = "error";
+    destinationNeeded.textContent = text;
+  }
+
+  function clearFolderError() {
+    delete destinationNeeded.dataset.kind;
+    destinationNeeded.textContent = "Choose a folder before starting.";
+    syncDestinationNeeded();
+  }
+
   function syncStart() {
-    startBtn.disabled = urlInput.value.trim() === "";
+    startBtn.disabled = urlInput.value.trim() === "" || destinationValue() === "";
   }
 
   function syncFollowAdd() {
@@ -90,29 +132,18 @@
     return picked ? picked.value : "rewind";
   }
 
+  function audioChoice(data) {
+    if (data && AUDIO_HELP[data.audio_source]) return data.audio_source;
+    if (data && data.live_from_start === false) return "live";
+    return "rewind";
+  }
+
   function setSource(source) {
     var value = AUDIO_HELP[source] ? source : "rewind";
     var input = document.querySelector('input[name="audio_source"][value="' + value + '"]');
     if (input) input.checked = true;
     audioHelp.textContent = AUDIO_HELP[value];
     if (audioConsequence) audioConsequence.textContent = AUDIO_CONSEQUENCE[value];
-  }
-
-  function renderDestinationButtons() {
-    destinationChoices.replaceChildren();
-    var current = destinationInput.value;
-    choices.forEach(function (folder) {
-      var button = document.createElement("button");
-      button.type = "button";
-      button.className = "choice" + (folder === current ? " is-selected" : "");
-      button.textContent = folder;
-      button.addEventListener("click", function () {
-        destinationInput.value = folder;
-        renderDestinationButtons();
-        queueSave(true);
-      });
-      destinationChoices.appendChild(button);
-    });
   }
 
   function renderPresetButtons() {
@@ -154,8 +185,9 @@
   }
 
   async function saveConfig() {
+    var generation = ++saveGeneration;
     var body = {
-      destination: destinationInput.value,
+      destination: destinationValue(),
       template: templateInput.value,
       audio_source: selectedSource()
     };
@@ -165,13 +197,18 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
+      if (generation !== saveGeneration) return;
       if (!response.ok) {
         var message = await readMessage(response);
+        if (generation !== saveGeneration) return;
         setSettingsNote(message || "Could not save settings.", "error");
+        showFolderError(message);
         return;
       }
       setSettingsNote("Saved.");
+      clearFolderError();
     } catch (err) {
+      if (generation !== saveGeneration) return;
       setSettingsNote("Could not save settings.", "error");
     }
   }
@@ -181,14 +218,14 @@
     var response = await fetch("/api/config");
     if (!response.ok) throw new Error("config");
     var data = await response.json();
-    destinationInput.value = known(data.destination) ? String(data.destination) : "";
+    destinationInput.value = destinationFromServer(data);
     templateInput.value = known(data.template) ? String(data.template) : "";
-    setSource(data.audio_source || (data.live_from_start ? "rewind" : "live"));
-    choices = Array.isArray(data.destination_choices) ? data.destination_choices.map(String) : [];
+    setSource(audioChoice(data));
     presets = data.template_presets && typeof data.template_presets === "object" ? data.template_presets : {};
     updateExactTemplate();
-    renderDestinationButtons();
     renderPresetButtons();
+    syncDestinationNeeded();
+    syncStart();
     hydrating = false;
   }
 
@@ -216,6 +253,11 @@
     line.appendChild(name);
     line.appendChild(document.createTextNode(text));
     parent.appendChild(line);
+  }
+
+  function streamHasDetail(stream) {
+    if (!stream || typeof stream !== "object") return false;
+    return known(stream.size) || known(stream.speed) || known(stream.fragment) || known(stream.fragment_total) || known(stream.percent);
   }
 
   function streamText(stream) {
@@ -268,10 +310,10 @@
       card.appendChild(meta);
     }
 
-    if (job.video && typeof job.video === "object") {
+    if (streamHasDetail(job.video)) {
       appendLabeled(card, "stream", "Video", streamText(job.video));
     }
-    if (job.audio && typeof job.audio === "object") {
+    if (streamHasDetail(job.audio)) {
       appendLabeled(card, "stream", "Audio", streamText(job.audio));
     }
 
@@ -338,9 +380,12 @@
   }
 
   async function refreshJobs() {
+    var request = ++jobsRequest;
     var response = await fetch("/api/jobs");
+    if (request !== jobsRequest) return;
     if (!response.ok) throw new Error("jobs");
     var data = await response.json();
+    if (request !== jobsRequest) return;
     var jobs = Array.isArray(data.jobs) ? data.jobs.slice() : [];
     jobsLoaded = true;
     if (!jobs.length) {
@@ -417,6 +462,12 @@
     });
 
     row.append(login, status, enabledLabel, remove);
+    if (known(follow.error)) {
+      var error = document.createElement("p");
+      error.className = "error";
+      error.textContent = String(follow.error);
+      row.appendChild(error);
+    }
     return row;
   }
 
@@ -469,6 +520,7 @@
   }
 
   function applyFollows(data) {
+    followsRequest += 1;
     var follows = data && Array.isArray(data.follows) ? data.follows : [];
     followsStamp = JSON.stringify(follows);
     renderFollows(follows);
@@ -482,9 +534,12 @@
   }
 
   async function refreshFollows() {
+    var request = ++followsRequest;
     var response = await fetch("/api/follows");
+    if (request !== followsRequest) return;
     if (!response.ok) throw new Error("follows");
     var data = await response.json();
+    if (request !== followsRequest) return;
     var follows = Array.isArray(data.follows) ? data.follows : [];
     var stamp = JSON.stringify(follows);
     if (stamp === followsStamp) return;
@@ -529,6 +584,13 @@
   form.addEventListener("submit", async function (event) {
     event.preventDefault();
     var url = urlInput.value.trim();
+    var destination = destinationValue();
+    if (!destination) {
+      clearFolderError();
+      destinationInput.focus();
+      syncStart();
+      return;
+    }
     if (!url) {
       setStatus("Enter a URL before starting a grab.", "error");
       urlInput.focus();
@@ -542,7 +604,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: url,
-          destination: destinationInput.value,
+          destination: destination,
           template: templateInput.value,
           audio_source: selectedSource()
         })
@@ -550,10 +612,24 @@
       if (!response.ok) {
         var message = await readMessage(response);
         setStatus(message || "Could not start the grab.", "error");
+        showFolderError(message);
         return;
       }
-      urlInput.value = "";
-      setStatus("Grab started.");
+      var job = null;
+      try {
+        job = await response.json();
+      } catch (parseErr) {
+        job = null;
+      }
+      if (job && job.state === "error") {
+        setStatus(known(job.error) ? String(job.error) : "Could not start the grab.", "error");
+      } else if (job && (job.state === "external" || job.owner === "external")) {
+        urlInput.value = "";
+        setStatus("Already downloading elsewhere.");
+      } else {
+        urlInput.value = "";
+        setStatus("Grab started.");
+      }
       await refreshJobs();
     } catch (err) {
       setStatus("Could not start the grab.", "error");
@@ -563,7 +639,8 @@
   });
 
   destinationInput.addEventListener("input", function () {
-    renderDestinationButtons();
+    clearFolderError();
+    syncStart();
     queueSave(false);
   });
 
@@ -583,12 +660,15 @@
   urlInput.addEventListener("input", syncStart);
 
   async function init() {
+    syncDestinationNeeded();
     syncStart();
     syncFollowAdd();
     try {
       await loadConfig();
     } catch (err) {
       hydrating = false;
+      syncDestinationNeeded();
+      syncStart();
       setSettingsNote("Settings are not available yet.", "error");
     }
     try {

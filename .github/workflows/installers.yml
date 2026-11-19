@@ -1,0 +1,145 @@
+name: Installers
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create or update release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create v0.1.0 release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view v0.1.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v0.1.0 already exists. Installer jobs replace its assets."
+          else
+            gh release create v0.1.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "v0.1.0" \
+              --notes "Windows setup Livegrab-Setup.exe includes Livegrab, yt-dlp, and ffmpeg. Debian package livegrab_0.1.0_all.deb depends on python3, ffmpeg, and yt-dlp."
+          fi
+
+  windows:
+    name: Windows installer
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010 -and $LASTEXITCODE -ne 1641) {
+            throw "choco install innosetup failed with exit code $LASTEXITCODE"
+          }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "ISCC.exe not found at $iscc"
+          }
+
+      - name: Download yt-dlp and ffmpeg essentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $cache = "packaging\build\cache"
+          $win = "packaging\build\windows"
+          New-Item -ItemType Directory -Force -Path $cache, $win | Out-Null
+          curl.exe -fL --retry 5 --retry-delay 2 -o "$cache\yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp.exe download failed" }
+          curl.exe -fL --retry 5 --retry-delay 2 -o "$cache\ffmpeg-release-essentials.zip" "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg essentials download failed" }
+          $extract = "$cache\ffmpeg-essentials"
+          if (Test-Path -LiteralPath $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -LiteralPath "$cache\ffmpeg-release-essentials.zip" -DestinationPath $extract
+          $ffmpeg = Get-ChildItem -LiteralPath $extract -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1
+          $ffprobe = Get-ChildItem -LiteralPath $extract -Filter ffprobe.exe -File -Recurse | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) {
+            throw "essentials archive did not contain ffmpeg.exe and ffprobe.exe"
+          }
+          Copy-Item -LiteralPath $ffmpeg.FullName -Destination "$win\ffmpeg.exe"
+          Copy-Item -LiteralPath $ffprobe.FullName -Destination "$win\ffprobe.exe"
+          Copy-Item -LiteralPath "$cache\yt-dlp.exe" -Destination "$win\yt-dlp.exe"
+
+      - name: Build Livegrab.exe
+        run: python -m PyInstaller --noconfirm --clean packaging/Livegrab.spec
+
+      - name: Compile Livegrab-Setup.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Test-Path -LiteralPath "dist\Livegrab.exe")) {
+            throw "PyInstaller did not write dist\Livegrab.exe"
+          }
+          Copy-Item -LiteralPath "dist\Livegrab.exe" -Destination "packaging\build\windows\Livegrab.exe"
+          foreach ($name in @("Livegrab.exe", "yt-dlp.exe", "ffmpeg.exe", "ffprobe.exe")) {
+            $path = Join-Path "packaging\build\windows" $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing $path" }
+          }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "packaging\livegrab.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $setup = "packaging\build\output\Livegrab-Setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "ISCC did not write $setup" }
+
+      - name: Upload Livegrab-Setup.exe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release upload v0.1.0 --clobber --repo "$env:GITHUB_REPOSITORY" "packaging\build\output\Livegrab-Setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  ubuntu:
+    name: Debian package
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Debian package
+        run: |
+          set -eu
+          sh packaging/build-deb.sh
+          depends=$(dpkg-deb -f dist/livegrab_0.1.0_all.deb Depends)
+          echo "Depends: $depends"
+          for pkg in python3 ffmpeg yt-dlp; do
+            if ! printf '%s\n' "$depends" | grep -Eq "(^|,)[[:space:]]*${pkg}([[:space:]]|,|\\(|$)"; then
+              echo "missing dependency: $pkg" >&2
+              exit 1
+            fi
+          done
+          if printf '%s\n' "$depends" | grep -Eqi '(^|,)[[:space:]]*node'; then
+            echo "Debian package must not depend on Node" >&2
+            exit 1
+          fi
+
+      - name: Upload Debian package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload v0.1.0 --clobber --repo "$GITHUB_REPOSITORY" dist/livegrab_0.1.0_all.deb

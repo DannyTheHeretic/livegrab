@@ -1,79 +1,138 @@
 """Tests for livegrab_lib.command.build_args."""
 
+import inspect
 import os
+import tempfile
 import unittest
+from unittest import mock
 
 from livegrab_lib.command import build_args
 
 URL = "https://www.youtube.com/watch?v=example"
-DESTINATION = "/home/random/Videos/Livegrab"
+DESTINATION = "/tmp/livegrab-videos"
 TEMPLATE = "%(title)s [%(id)s].%(ext)s"
-YTDLP = "/usr/bin/yt-dlp"
-NODE_EXISTS = "/usr/bin/python3"
-NODE_MISSING = "/tmp/livegrab-node-does-not-exist"
+YTDLP = "/opt/livegrab-test/yt-dlp"
+WINDOWS_DESTINATION = "C:\\Users\\someone\\Videos"
+JS_RUNTIME_TOKENS = ("node", "--js-runtimes", "ejs:github", "deno", "bun", "quickjs")
 
-JS_FLAGS = ("--js-runtimes", "--remote-components", "ejs:github")
+
+def call_build_args(live_from_start, destination=DESTINATION, ytdlp_path=YTDLP, node_path=""):
+    """Call build_args without requiring a Node.js parameter."""
+    kwargs = {}
+    parameters = inspect.signature(build_args).parameters
+    if "ytdlp_path" in parameters:
+        kwargs["ytdlp_path"] = ytdlp_path
+    if node_path is not _OMIT and "node_path" in parameters:
+        kwargs["node_path"] = node_path
+    return build_args(URL, destination, TEMPLATE, live_from_start, **kwargs)
+
+
+class _Omit:
+    pass
+
+
+_OMIT = _Omit()
 
 
 class BuildArgsTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not os.path.exists(NODE_EXISTS):
-            raise unittest.SkipTest(f"{NODE_EXISTS} is not on disk")
-        if os.path.exists(NODE_MISSING):
-            raise unittest.SkipTest(f"{NODE_MISSING} unexpectedly exists")
-
-    def _args(self, live_from_start, node_path):
-        return build_args(
-            URL,
-            DESTINATION,
-            TEMPLATE,
-            live_from_start,
-            YTDLP,
-            node_path,
+    def setUp(self):
+        self._ffmpeg = mock.patch(
+            "livegrab_lib.command.platform_ffmpeg_path",
+            return_value=None,
         )
+        self._ffmpeg.start()
+
+    def tearDown(self):
+        self._ffmpeg.stop()
+
+    def assert_no_javascript_runtime(self, args):
+        blob = "\n".join(str(part) for part in args)
+        for token in JS_RUNTIME_TOKENS:
+            self.assertNotIn(token, blob, msg="%r found in %s" % (token, args))
 
     def test_starts_with_ytdlp_newline_and_no_update(self):
-        args = self._args(False, "")
+        args = call_build_args(False)
         self.assertEqual(args[:3], [YTDLP, "--newline", "--no-update"])
+        self.assertNotIn("--ffmpeg-location", args)
+        self.assert_no_javascript_runtime(args)
+
+    def test_ffmpeg_location_is_the_ffmpeg_directory(self):
+        ffmpeg = "/opt/livegrab-test/bin/ffmpeg"
+        with mock.patch(
+            "livegrab_lib.command.platform_ffmpeg_path",
+            return_value=ffmpeg,
+        ):
+            disabled = call_build_args(False)
+            enabled = call_build_args(True)
+        self.assertEqual(
+            disabled[disabled.index("--ffmpeg-location") + 1],
+            "/opt/livegrab-test/bin",
+        )
+        self.assertNotIn("--live-from-start", disabled)
+        self.assertIn("--live-from-start", enabled)
+        self.assertEqual(
+            enabled[enabled.index("--ffmpeg-location") + 1],
+            "/opt/livegrab-test/bin",
+        )
+        self.assertIn("--no-js-runtimes", disabled)
+        self.assert_no_javascript_runtime(disabled)
+        self.assert_no_javascript_runtime(enabled)
 
     def test_live_from_start_only_when_enabled(self):
-        self.assertNotIn("--live-from-start", self._args(False, ""))
-        self.assertIn("--live-from-start", self._args(True, ""))
+        disabled = call_build_args(False)
+        enabled = call_build_args(True)
+        self.assertNotIn("--live-from-start", disabled)
+        self.assertIn("--live-from-start", enabled)
+        self.assert_no_javascript_runtime(disabled)
+        self.assert_no_javascript_runtime(enabled)
 
     def test_live_choice_omits_live_from_start(self):
-        self.assertNotIn("--live-from-start", self._args("live", ""))
+        args = call_build_args("live")
+        self.assertNotIn("--live-from-start", args)
+        self.assert_no_javascript_runtime(args)
 
     def test_rewind_choice_includes_live_from_start(self):
-        self.assertIn("--live-from-start", self._args("rewind", ""))
+        args = call_build_args("rewind")
+        self.assertIn("--live-from-start", args)
+        self.assert_no_javascript_runtime(args)
 
-    def test_node_flags_absent_when_node_path_empty(self):
-        args = self._args(True, "")
-        for flag in JS_FLAGS:
-            self.assertNotIn(flag, args)
-        self.assertFalse(any(arg.startswith("node:") for arg in args))
+    def test_windows_destination_is_joined(self):
+        args = call_build_args(False, destination=WINDOWS_DESTINATION)
+        self.assertIsInstance(args, list)
+        output = args[args.index("-o") + 1]
+        self.assertEqual(output, os.path.join(WINDOWS_DESTINATION, TEMPLATE))
+        self.assertNotIn("--live-from-start", args)
+        self.assert_no_javascript_runtime(args)
+        enabled = call_build_args(True, destination=WINDOWS_DESTINATION)
+        self.assertIn("--live-from-start", enabled)
+        self.assertEqual(
+            enabled[enabled.index("-o") + 1],
+            os.path.join(WINDOWS_DESTINATION, TEMPLATE),
+        )
+        self.assert_no_javascript_runtime(enabled)
 
-    def test_node_flags_present_when_path_exists(self):
-        args = self._args(False, NODE_EXISTS)
-        js = args.index("--js-runtimes")
-        self.assertEqual(args[js + 1], "node:" + NODE_EXISTS)
-        remote = args.index("--remote-components")
-        self.assertEqual(args[remote + 1], "ejs:github")
-
-    def test_node_flags_absent_when_path_does_not_exist(self):
-        args = self._args(True, NODE_MISSING)
-        for flag in JS_FLAGS:
-            self.assertNotIn(flag, args)
-        self.assertFalse(any(arg.startswith("node:") for arg in args))
+    def test_build_args_omits_javascript_runtimes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = os.path.join(directory, "runtime")
+            with open(runtime, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            destination = os.path.join(directory, "out")
+            parameters = inspect.signature(build_args).parameters
+            node_path = runtime if "node_path" in parameters else _OMIT
+            args = call_build_args(True, destination=destination, node_path=node_path)
+        self.assert_no_javascript_runtime(args)
+        self.assertNotIn("/home/random", "\n".join(str(part) for part in args))
+        self.assertNotIn("/usr/bin/yt-dlp", "\n".join(str(part) for part in args))
 
     def test_remux_output_template_and_url(self):
-        args = self._args(True, "")
+        args = call_build_args(True)
         remux = args.index("--remux-video")
         self.assertEqual(args[remux + 1], "mp4")
         output = args.index("-o")
-        self.assertEqual(args[output + 1], DESTINATION + "/" + TEMPLATE)
+        self.assertEqual(args[output + 1], os.path.join(DESTINATION, TEMPLATE))
         self.assertIn(URL, args)
         self.assertEqual(args[-1], URL)
+        self.assert_no_javascript_runtime(args)
 
 
 if __name__ == "__main__":

@@ -113,11 +113,37 @@ input[type="text"] {
   font-size: 1.05rem;
 }
 
+#url,
+#destination {
+  font-size: 1.15rem;
+  min-height: 3.4rem;
+}
+
 #url {
   flex: 1;
   min-width: 0;
-  font-size: 1.15rem;
-  min-height: 3.4rem;
+}
+
+.folder-field {
+  padding: 0.95rem 1rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.9rem;
+  background: var(--accent-soft);
+}
+
+.folder-field > label {
+  font-size: 1.05rem;
+}
+
+.need {
+  margin: 0.45rem 0 0;
+  color: var(--ink);
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+
+.need[data-kind="error"] {
+  color: var(--danger);
 }
 
 button {
@@ -288,6 +314,11 @@ code {
 .follow-status.is-offline,
 .follow-status.is-checking {
   color: var(--muted);
+}
+
+.follow .error {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .follow .check {

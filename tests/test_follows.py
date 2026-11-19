@@ -6,11 +6,13 @@ These tests do not start yt-dlp. The checker is given a fake probe.
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from livegrab_lib.config import load_config
 from livegrab_lib.follows import (
     FollowChecker,
+    FollowStore,
     check_follows,
     parse_twitch_login,
     probe_args,
@@ -177,12 +179,25 @@ class CheckFollowsTests(unittest.TestCase):
         self.assertIsNone(result[0]["last_checked"])
 
 
+class FollowStoreTests(unittest.TestCase):
+    def test_pathlib_path_can_be_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "follows.json"
+            store = FollowStore(path)
+            view = store.add("example")
+            self.assertEqual(view["follows"][0]["login"], "example")
+            self.assertTrue(path.is_file())
+            stored = path.read_text(encoding="utf-8")
+            self.assertIn("example", stored)
+
+
 class ProbeArgsTests(unittest.TestCase):
     def test_metadata_only_and_no_live_from_start(self):
         args = probe_args("kelsaco")
-        self.assertEqual(args[0], "/usr/bin/yt-dlp")
+        self.assertIn(Path(args[0]).name.lower(), ("yt-dlp", "yt-dlp.exe"))
         self.assertIn("--no-download", args)
         self.assertIn("--dump-single-json", args)
+        self.assertIn("--no-js-runtimes", args)
         self.assertNotIn("--live-from-start", args)
         self.assertNotIn("--no-simulate", args)
         self.assertNotIn("-o", args)

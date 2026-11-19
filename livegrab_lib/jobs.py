@@ -1,7 +1,7 @@
 """In-memory grab jobs, persisted to jobs.json.
 
-yt-dlp is spawned in its own process group. Stop sends SIGTERM only to a
-group this process created. A PID Livegrab did not spawn is never signaled,
+On POSIX, yt-dlp is spawned in its own session. Stop sends SIGTERM only to
+a process this app created. A PID Livegrab did not spawn is never signaled,
 including an already-running external grab.
 """
 
@@ -9,29 +9,31 @@ from __future__ import annotations
 
 import copy
 import json
+import ntpath
 import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
-from livegrab_lib.command import DEFAULT_NODE, DEFAULT_YTDLP, build_args
-from livegrab_lib.config import (
-    CONFIG_DIR,
-    ensure_destination,
-    is_protected_destination,
-    load_config,
-)
+from livegrab_lib.command import build_args
+from livegrab_lib.config import ensure_destination, load_config
+from livegrab_lib.platform import config_dir, subprocess_kwargs
+from livegrab_lib.platform import ytdlp_path as platform_ytdlp_path
 from livegrab_lib.progress import parse_progress_line
 
-JOBS_PATH = os.path.join(CONFIG_DIR, "jobs.json")
+JOBS_PATH = config_dir() / "jobs.json"
 LOG_TAIL = 30
 ACTIVE_STATES = {"starting", "downloading", "merging", "external"}
 RUNNING_STATES = {"starting", "downloading", "merging"}
-# Hard stop: never deliver a signal to the Tartube yt-dlp, even by accident.
+# Historical pid. Never signal it.
 NEVER_SIGNAL_PIDS = {149396}
+FOLDER_REQUIRED = "Choose a folder before starting"
+FOLDER_UNCREATABLE = "Could not create that folder"
 
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _ID_PATTERNS = (
@@ -101,9 +103,10 @@ def read_argv(pid: int) -> list[str] | None:
 
 
 def pid_alive(pid) -> bool:
-    """True when /proc/<pid> exists and the process is not a zombie.
+    """True when the process is still running.
 
-    Existence is checked by reading /proc. Signal 0 is never sent.
+    POSIX reads /proc and treats a zombie as gone. Windows reads the
+    process exit code. Signal 0 is never sent.
     """
     try:
         number = int(pid)
@@ -111,6 +114,8 @@ def pid_alive(pid) -> bool:
         return False
     if number <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_alive(number)
     try:
         with open(f"/proc/{number}/stat", "r", encoding="utf-8") as handle:
             stat = handle.read()
@@ -122,12 +127,60 @@ def pid_alive(pid) -> bool:
     return match.group(1) != "Z"
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """True when Windows still has this process. Does not signal it."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, OSError):
+        return False
+    # PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE
+    query = 0x1000
+    still_active = 259
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        return False
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(query, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return int(code.value) == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _is_ytdlp(argv: list[str]) -> bool:
-    for part in argv:
-        base = os.path.basename(part)
-        if base == "yt-dlp" or base.startswith("yt-dlp-"):
-            return True
-    return False
+    """True when argv names yt-dlp, including a Windows yt-dlp.exe."""
+    return any(_ytdlp_name(part) for part in argv)
+
+
+def _ytdlp_name(part: str) -> bool:
+    """True for yt-dlp, yt-dlp-…, and those names with a .exe suffix.
+
+    The comparison is case-insensitive. Backslashes count as separators so
+    a Windows path is recognized on any host.
+    """
+    if not isinstance(part, str) or not part:
+        return False
+    base = ntpath.basename(part)
+    stem, ext = ntpath.splitext(base)
+    if ext.casefold() == ".exe":
+        base = stem
+    folded = base.casefold()
+    return folded == "yt-dlp" or folded.startswith("yt-dlp-")
 
 
 def _mentions_target(argv: list[str], url: str, video_id: str | None) -> bool:
@@ -145,22 +198,15 @@ def _mentions_target(argv: list[str], url: str, video_id: str | None) -> bool:
 def find_external_ytdlp(url: str, skip_pids: set[int] | None = None) -> list[dict]:
     """Return yt-dlp processes already grabbing this URL or video id.
 
-    Only /proc cmdline is read. Nothing is signaled and no download starts.
+    POSIX reads /proc cmdline. Windows reads the yt-dlp.exe image name and
+    that process's command line. Nothing is signaled and no download starts.
     """
     skip = skip_pids or set()
     video_id = extract_video_id(url)
     found = []
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return found
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
+    for pid, argv in _external_candidates():
         if pid in skip or pid == os.getpid():
             continue
-        argv = read_argv(pid)
         if not argv or not _is_ytdlp(argv):
             continue
         if not _mentions_target(argv, url, video_id):
@@ -178,6 +224,369 @@ def find_external_ytdlp(url: str, skip_pids: set[int] | None = None) -> list[dic
         )
     found.sort(key=lambda item: (not item["exact_url"], item["pid"]))
     return found
+
+
+def _external_candidates():
+    """Yield (pid, argv) for processes the external-grab check may inspect."""
+    if os.name == "nt":
+        # A failed Windows read must not block a grab. Detection is best-effort.
+        try:
+            yield from _windows_ytdlp_argvs()
+        except Exception:
+            return
+        return
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        argv = read_argv(pid)
+        if argv:
+            yield pid, argv
+
+
+def _windows_ytdlp_argvs():
+    """Yield (pid, argv) for a running yt-dlp.exe. Does not signal it."""
+    for pid, image in _windows_process_names():
+        if pid <= 0 or pid == os.getpid() or not _ytdlp_name(image):
+            continue
+        try:
+            argv = _windows_command_argv(pid)
+        except Exception:
+            continue
+        if not argv:
+            continue
+        if not _is_ytdlp(argv):
+            argv = [image, *argv]
+        yield pid, argv
+
+
+def _windows_process_names():
+    """Yield (pid, executable file name) without opening other processes."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, OSError):
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # TH32CS_SNAPPROCESS
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid:
+        yield from _windows_process_names_by_image()
+        return
+    found = False
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            found = False
+        else:
+            while True:
+                name = entry.szExeFile
+                pid = int(entry.th32ProcessID)
+                if name and pid > 0:
+                    found = True
+                    yield pid, name
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if not found:
+        yield from _windows_process_names_by_image()
+
+
+def _windows_process_names_by_image():
+    """Yield (pid, full image path) when the process snapshot is unavailable."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, OSError):
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return
+    enum = getattr(kernel32, "K32EnumProcesses", None)
+    if enum is None:
+        try:
+            enum = ctypes.WinDLL("psapi", use_last_error=True).EnumProcesses
+        except OSError:
+            return
+    enum.argtypes = (
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    enum.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+    count = 512
+    pids = []
+    while count <= 65536:
+        array = (wintypes.DWORD * count)()
+        needed = wintypes.DWORD()
+        if not enum(array, ctypes.sizeof(array), ctypes.byref(needed)):
+            return
+        if needed.value < ctypes.sizeof(array):
+            width = ctypes.sizeof(wintypes.DWORD)
+            total = needed.value // width
+            pids = [int(array[index]) for index in range(total) if int(array[index]) > 0]
+            break
+        count *= 2
+    # PROCESS_QUERY_LIMITED_INFORMATION. Enough to read the image path.
+    query = 0x1000
+    for pid in pids:
+        handle = kernel32.OpenProcess(query, False, pid)
+        if not handle:
+            continue
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                image = buf.value
+                if image:
+                    yield pid, image
+        finally:
+            kernel32.CloseHandle(handle)
+
+
+def _windows_command_argv(pid: int) -> list[str] | None:
+    """Return a yt-dlp process command line. Does not signal the process."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, OSError):
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    except OSError:
+        return None
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.ReadProcessMemory.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    kernel32.ReadProcessMemory.restype = wintypes.BOOL
+    ntdll.NtQueryInformationProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    )
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, then limited + VM_READ.
+    handle = kernel32.OpenProcess(0x0410, False, pid)
+    if not handle:
+        handle = kernel32.OpenProcess(0x1010, False, pid)
+    if not handle:
+        return None
+    try:
+        command = _windows_command_line(kernel32, ntdll, handle)
+    finally:
+        kernel32.CloseHandle(handle)
+    if not command:
+        return None
+    return _split_command_line(command)
+
+
+def _windows_command_line(kernel32, ntdll, handle) -> str | None:
+    """Read CommandLine from the process PEB, including a 32-bit yt-dlp.exe."""
+    wow64 = _query_pointer(ntdll, handle, 26)
+    if wow64:
+        return _command_line_at(kernel32, handle, wow64, 4)
+    peb = _native_peb(ntdll, handle)
+    if not peb:
+        return None
+    return _command_line_at(kernel32, handle, peb, _native_pointer_size())
+
+
+def _native_pointer_size() -> int:
+    import ctypes
+
+    return ctypes.sizeof(ctypes.c_void_p)
+
+
+def _native_peb(ntdll, handle) -> int | None:
+    import ctypes
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("Reserved1", ctypes.c_void_p),
+            ("PebBaseAddress", ctypes.c_void_p),
+            ("Reserved2", ctypes.c_void_p * 2),
+            ("UniqueProcessId", ctypes.c_void_p),
+            ("Reserved3", ctypes.c_void_p),
+        ]
+
+    info = PROCESS_BASIC_INFORMATION()
+    status = ntdll.NtQueryInformationProcess(
+        handle,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        None,
+    )
+    if status != 0 or not info.PebBaseAddress:
+        return None
+    return int(info.PebBaseAddress)
+
+
+def _query_pointer(ntdll, handle, information_class: int) -> int | None:
+    import ctypes
+
+    value = ctypes.c_void_p()
+    status = ntdll.NtQueryInformationProcess(
+        handle,
+        information_class,
+        ctypes.byref(value),
+        ctypes.sizeof(value),
+        None,
+    )
+    if status != 0 or not value.value:
+        return None
+    return int(value.value)
+
+
+def _command_line_at(kernel32, handle, peb: int, pointer_size: int) -> str | None:
+    if pointer_size == 8:
+        params_offset = 0x20
+        command_offset = 0x70
+        header_size = 16
+        buffer_at = 8
+    elif pointer_size == 4:
+        params_offset = 0x10
+        command_offset = 0x40
+        header_size = 8
+        buffer_at = 4
+    else:
+        return None
+    params = _read_pointer(kernel32, handle, peb + params_offset, pointer_size)
+    if not params:
+        return None
+    header = _read_bytes(kernel32, handle, params + command_offset, header_size)
+    if header is None or len(header) < header_size:
+        return None
+    length = int.from_bytes(header[0:2], "little")
+    if length <= 0 or length > 32767 or length % 2:
+        return None
+    buffer = int.from_bytes(header[buffer_at : buffer_at + pointer_size], "little")
+    if not buffer:
+        return None
+    raw = _read_bytes(kernel32, handle, buffer, length)
+    if raw is None or len(raw) != length:
+        return None
+    return raw.decode("utf-16-le", "replace")
+
+
+def _read_pointer(kernel32, handle, address: int, pointer_size: int) -> int | None:
+    raw = _read_bytes(kernel32, handle, address, pointer_size)
+    if raw is None or len(raw) != pointer_size:
+        return None
+    value = int.from_bytes(raw, "little")
+    return value or None
+
+
+def _read_bytes(kernel32, handle, address: int, size: int) -> bytes | None:
+    import ctypes
+
+    if not address or size <= 0:
+        return None
+    buffer = ctypes.create_string_buffer(size)
+    read = ctypes.c_size_t()
+    ok = kernel32.ReadProcessMemory(
+        handle,
+        ctypes.c_void_p(address),
+        ctypes.cast(buffer, ctypes.c_void_p),
+        size,
+        ctypes.byref(read),
+    )
+    if not ok or read.value != size:
+        return None
+    return buffer.raw
+
+
+def _split_command_line(command: str) -> list[str] | None:
+    """Split a Windows command line the way CreateProcess does."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+    shell32.CommandLineToArgvW.argtypes = (
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_int),
+    )
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    count = ctypes.c_int()
+    parsed = shell32.CommandLineToArgvW(command, ctypes.byref(count))
+    if not parsed or count.value <= 0:
+        return None
+    try:
+        return [parsed[index] for index in range(count.value)]
+    finally:
+        kernel32.LocalFree(ctypes.cast(parsed, ctypes.c_void_p))
 
 
 def _output_arg(argv: list[str]) -> tuple[str | None, str | None]:
@@ -277,7 +686,6 @@ class JobManager:
         live_from_start=None,
         audio_source=None,
         ytdlp_path=None,
-        node_path=None,
     ) -> dict:
         if not isinstance(url, str) or not url.strip():
             raise JobError("url is required")
@@ -289,7 +697,7 @@ class JobManager:
         if live_from_start is not None and not isinstance(live_from_start, bool):
             raise JobError("live_from_start must be a boolean")
         config = load_config()
-        destination = _choose_text(destination, config["destination"])
+        destination = _resolve_folder(destination, config.get("destination"))
         template = _choose_text(template, config["template"])
         if audio_source is not None:
             live_from_start = audio_source == "rewind"
@@ -300,8 +708,6 @@ class JobManager:
                 "rewind" if config["live_from_start"] else "live"
             )
             live_from_start = audio_source == "rewind"
-        if not destination:
-            raise JobError("destination must be a non-empty string")
         if not template:
             raise JobError("template must be a non-empty string")
 
@@ -315,17 +721,17 @@ class JobManager:
         if external:
             return self._record_external(url, destination, template, live_from_start, external[0])
 
-        if is_protected_destination(destination):
-            raise JobError("that destination is not available")
-
-        ensure_destination(destination)
+        try:
+            ensure_destination(destination)
+        except OSError:
+            raise JobError(FOLDER_UNCREATABLE) from None
+        binary = ytdlp_path if isinstance(ytdlp_path, str) and ytdlp_path.strip() else platform_ytdlp_path()
         args = build_args(
             url,
             destination,
             template,
             audio_source,
-            ytdlp_path or DEFAULT_YTDLP,
-            DEFAULT_NODE if node_path is None else node_path,
+            binary,
         )
         job = _blank_job()
         job.update(
@@ -340,17 +746,7 @@ class JobManager:
             }
         )
         try:
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                bufsize=1,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            proc = subprocess.Popen(args, **_popen_kwargs())
         except OSError as exc:
             job["state"] = "error"
             job["error"] = f"Could not start yt-dlp: {exc}"
@@ -394,10 +790,10 @@ class JobManager:
         if pid in NEVER_SIGNAL_PIDS:
             return 409, {"error": "Livegrab will not stop a download it did not start"}
         try:
-            os.killpg(pid, signal.SIGTERM)
+            _signal_spawned(pid)
         except ProcessLookupError:
             pass
-        except PermissionError:
+        except (PermissionError, OSError):
             return 409, {"error": "Livegrab will not stop a download it did not start"}
         return 200, snapshot
 
@@ -409,11 +805,15 @@ class JobManager:
         if number in NEVER_SIGNAL_PIDS or number not in self._spawned:
             return False
         argv = read_argv(number)
-        if not argv or not _is_ytdlp(argv):
-            return False
-        if any("Tartube_videos" in part for part in argv):
-            return False
-        return _mentions_target(argv, url, extract_video_id(url))
+        if argv:
+            if not _is_ytdlp(argv):
+                return False
+            return _mentions_target(argv, url, extract_video_id(url))
+        # No /proc cmdline on Windows. The pid was spawned here, and the
+        # historical pid was already refused above.
+        if os.name == "nt":
+            return pid_alive(number)
+        return False
 
     def _record_external(self, url, destination, template, live_from_start, match) -> dict:
         external_destination = match.get("destination") or destination
@@ -554,15 +954,61 @@ class JobManager:
             self._save_locked()
 
     def _save_locked(self) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        temporary = self.path + ".tmp"
+        path = Path(self.path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
         payload = {"jobs": [public_job(job) for job in self._jobs]}
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, self.path)
+        os.replace(temporary, path)
+
+
+def _popen_kwargs() -> dict:
+    """Argv spawn options. shell stays off. A new session is POSIX-only."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "bufsize": 1,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    kwargs.update(subprocess_kwargs())
+    kwargs["shell"] = False
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _signal_spawned(pid: int) -> None:
+    """SIGTERM a process this app spawned. On POSIX, signal its session."""
+    number = int(pid)
+    if sys.platform == "win32":
+        os.kill(number, signal.SIGTERM)
+        return
+    os.killpg(number, signal.SIGTERM)
+
+
+def _resolve_folder(value, fallback) -> str:
+    """Return the folder to record into.
+
+    A missing value uses the saved folder. A blank value is refused.
+    """
+    if value is None:
+        chosen = fallback
+    else:
+        if not isinstance(value, str):
+            raise JobError("expected a string")
+        chosen = value
+        if not chosen.strip():
+            raise JobError(FOLDER_REQUIRED)
+    if not isinstance(chosen, str) or not chosen.strip():
+        raise JobError(FOLDER_REQUIRED)
+    return chosen.strip()
 
 
 def _choose_text(value, fallback: str) -> str:

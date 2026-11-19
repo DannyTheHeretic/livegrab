@@ -1,0 +1,10 @@
+Package: livegrab
+Version: 0.1.0
+Section: video
+Priority: optional
+Architecture: all
+Depends: python3, ffmpeg, yt-dlp
+Maintainer: Livegrab Maintainers <livegrab@localhost>
+Description: Record a livestream URL with yt-dlp
+ Livegrab serves a page on 127.0.0.1 and records a livestream with yt-dlp.
+ The ffmpeg and yt-dlp packages are installed together with this package.

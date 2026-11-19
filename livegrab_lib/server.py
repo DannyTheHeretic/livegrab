@@ -11,9 +11,10 @@ from urllib.parse import unquote, urlparse
 from livegrab_lib.config import config_view, update_config
 from livegrab_lib.follows import FollowChecker, FollowError
 from livegrab_lib.jobs import JobError, JobManager
+from livegrab_lib.platform import ffmpeg_path, ytdlp_path
 
 HOST = "127.0.0.1"
-PORTS = (8765, 8766)
+PORTS = (8765,)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_BODY = 1_000_000
 
@@ -30,7 +31,10 @@ _MIME = {
 
 
 class LivegrabServer(ThreadingHTTPServer):
-    allow_reuse_address = True
+    # Windows treats SO_REUSEADDR as permission to bind a port that is
+    # already listening. Leave it off there so an existing listener keeps
+    # 8765. POSIX still allows a quick restart without taking that port.
+    allow_reuse_address = sys.platform != "win32"
     daemon_threads = True
 
 
@@ -215,8 +219,8 @@ class LivegrabHandler(BaseHTTPRequestHandler):
 
 
 def bind_server(host: str = HOST, ports=PORTS):
-    if host != HOST:
-        raise RuntimeError("Livegrab binds to 127.0.0.1 only")
+    if host != HOST or tuple(ports) != (8765,):
+        raise RuntimeError("Livegrab binds to 127.0.0.1:8765 only")
     last_error = None
     for port in ports:
         try:
@@ -231,9 +235,13 @@ def main() -> int:
     follows = FollowChecker(manager)
     LivegrabHandler.manager = manager
     LivegrabHandler.follows = follows
-    follows.start()
     httpd, port = bind_server()
+    follows.start()
     print(f"Livegrab listening on http://127.0.0.1:{port}", flush=True)
+    print(
+        "Livegrab tools yt-dlp=%s ffmpeg=%s" % (ytdlp_path(), ffmpeg_path() or ""),
+        flush=True,
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

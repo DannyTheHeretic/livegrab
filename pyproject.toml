@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livegrab"
+version = "0.1.0"
+description = "Localhost HTTP app that records a livestream with yt-dlp. Node.js, yt-dlp, and ffmpeg stay external programs and are not Python package dependencies."
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = []
+
+[project.scripts]
+livegrab = "livegrab_lib.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livegrab_lib"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"static" = "static"
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "livegrab_lib",
+  "static",
+  "README.md",
+  "pyproject.toml",
+]

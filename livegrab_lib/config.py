@@ -1,26 +1,23 @@
 """Load and save Livegrab settings.
 
 The destination directory is created only when a job starts, never at import.
+A new config leaves destination empty until the user chooses a folder.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path, PureWindowsPath
 
-CONFIG_DIR = "/home/random/.config/livegrab"
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+from livegrab_lib.platform import config_dir, ensure_config_dir
 
-DEFAULT_DESTINATION = "/home/random/Videos/Livegrab"
 DEFAULT_TEMPLATE = "%(title)s [%(id)s].%(ext)s"
 DEFAULT_LIVE_FROM_START = True
 DEFAULT_AUDIO_SOURCE = "rewind"
 AUDIO_SOURCES = ("live", "rewind")
 
-DESTINATION_CHOICES = (
-    DEFAULT_DESTINATION,
-    "/home/random/Videos",
-)
+DESTINATION_CHOICES = ()
 
 TEMPLATE_PRESETS = {
     "Title [id]": "%(title)s [%(id)s].%(ext)s",
@@ -28,17 +25,18 @@ TEMPLATE_PRESETS = {
     "Id": "%(id)s.%(ext)s",
 }
 
-# The Tartube grab lives here. Livegrab never creates or writes inside it.
-PROTECTED_DESTINATION = "/home/random/Videos/Tartube_videos"
+CONFIG_DIR = os.fspath(config_dir())
+CONFIG_PATH = config_dir() / "config.json"
+
+
+def _config_file() -> Path:
+    """Settings file. Looks up CONFIG_PATH on every call."""
+    return Path(CONFIG_PATH)
 
 
 def is_protected_destination(path: str) -> bool:
-    """True when path is the Tartube download directory or something inside it."""
-    if not isinstance(path, str) or not path.strip():
-        return False
-    candidate = os.path.normpath(os.path.abspath(path))
-    banned = os.path.normpath(PROTECTED_DESTINATION)
-    return candidate == banned or candidate.startswith(banned + os.sep)
+    """No destination is reserved. Users may save wherever they choose."""
+    return False
 
 
 def source_from_flag(live_from_start: bool) -> str:
@@ -51,18 +49,40 @@ def flag_from_source(audio_source: str) -> bool:
 
 def default_config() -> dict:
     return {
-        "destination": DEFAULT_DESTINATION,
+        "destination": "",
         "template": DEFAULT_TEMPLATE,
         "live_from_start": DEFAULT_LIVE_FROM_START,
         "audio_source": DEFAULT_AUDIO_SOURCE,
     }
 
 
+def _require_destination(destination) -> str:
+    """Return a folder the user chose.
+
+    An empty string is invalid. An absolute path is valid, including a
+    Windows drive path such as ``C:\\Users\\someone\\Videos`` and a UNC
+    path. Any other non-empty path the user typed is valid too.
+    """
+    if not isinstance(destination, str):
+        raise ValueError("destination must be a non-empty string")
+    text = destination.strip()
+    if not text:
+        raise ValueError("Choose a folder before starting")
+    native = Path(text)
+    windows = PureWindowsPath(text)
+    if native.is_absolute() or windows.is_absolute():
+        return text
+    if native.parts or windows.parts:
+        return text
+    raise ValueError("destination must be a non-empty string")
+
+
 def load_config() -> dict:
     """Return saved settings, or the defaults when the file is missing."""
     data = default_config()
+    path = _config_file()
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8") as handle:
             stored = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return data
@@ -72,8 +92,8 @@ def load_config() -> dict:
     template = stored.get("template")
     live_from_start = stored.get("live_from_start")
     audio_source = stored.get("audio_source")
-    if isinstance(destination, str) and destination.strip():
-        data["destination"] = destination.strip()
+    if isinstance(destination, str):
+        data["destination"] = destination
     if isinstance(template, str) and template.strip():
         data["template"] = template.strip()
     if audio_source in AUDIO_SOURCES:
@@ -108,20 +128,21 @@ def save_config(config: dict) -> dict:
         audio_source = source_from_flag(live_from_start)
     else:
         audio_source = current["audio_source"]
-    if not isinstance(destination, str) or not destination.strip():
-        raise ValueError("destination must be a non-empty string")
+    destination = _require_destination(destination)
     if not isinstance(template, str) or not template.strip():
         raise ValueError("template must be a non-empty string")
-    if is_protected_destination(destination):
-        raise ValueError("that destination is not available")
     stored = {
-        "destination": destination.strip(),
+        "destination": destination,
         "template": template.strip(),
         "audio_source": audio_source,
         "live_from_start": flag_from_source(audio_source),
     }
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    _atomic_json(CONFIG_PATH, stored)
+    path = _config_file()
+    if path.parent == config_dir():
+        ensure_config_dir()
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json(path, stored)
     return stored
 
 
@@ -171,14 +192,14 @@ def config_view(config: dict | None = None) -> dict:
 
 def ensure_destination(path: str) -> None:
     """Create a destination directory. Call this only when a job starts."""
-    if is_protected_destination(path):
-        raise ValueError("that destination is not available")
-    os.makedirs(path, exist_ok=True)
+    folder = _require_destination(path)
+    Path(folder).mkdir(parents=True, exist_ok=True)
 
 
-def _atomic_json(path: str, payload: dict) -> None:
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
+def _atomic_json(path: Path, payload: dict) -> None:
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
         handle.flush()

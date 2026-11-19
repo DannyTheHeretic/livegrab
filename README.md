@@ -1,52 +1,121 @@
 # Livegrab
 
-Livegrab is a local page that drives the system `yt-dlp`. It starts grabs on this machine and shows their progress in the browser. It does not upload anything and it does not talk to a remote Livegrab service.
+Livegrab records a livestream URL with yt-dlp. Choose live player audio or from-the-start audio. Follow Twitch channels and Livegrab auto-grabs them with live player audio when they go live.
 
-## Run
+## Requirements
 
-From `/home/random/Projects/livegrab`:
+On Windows, macOS, and Linux:
+
+- Python 3
+- `yt-dlp` on `PATH`
+- `ffmpeg` on `PATH`
+
+The Windows installer and the Debian package bring yt-dlp and ffmpeg in with the app. A checkout you run yourself still needs them on `PATH`.
+
+## Downloads
+
+Installers are attached to GitHub releases at https://github.com/Unaware-Kerbin/livegrab/releases. The Windows setup includes Livegrab, yt-dlp, and ffmpeg. Exact file links are added after the first Actions upload.
+
+`pip` and `pipx` remain an alternative once the PyPI package is published.
+
+## Installer
+
+**Windows:** `Livegrab-Setup.exe` installs the app, yt-dlp, and ffmpeg into one folder. It does not need Python, pip, yt-dlp, or ffmpeg to be installed already. Python is inside the application.
+
+**Debian and Ubuntu:** `sudo apt install ./dist/livegrab_*.deb` installs Livegrab plus the `ffmpeg` and `yt-dlp` packages.
+
+**Linux folder:** `packaging/build-linux-bundle.sh` downloads a static ffmpeg (and ffprobe) and the yt-dlp Linux binary into `dist/livegrab-linux/`, with a launcher that puts those binaries first on `PATH`.
+
+**macOS:** `packaging/build-macos.sh` would download the macOS yt-dlp binary and a macOS ffmpeg build and lay out `Livegrab.app`. That script is not built on this machine.
+
+## Install
+
+These commands work once the PyPI package name `livegrab` is published.
+
+**pipx** (preferred; it isolates the app):
+
+```bash
+pipx install livegrab
+```
+
+Then run `livegrab` and open http://127.0.0.1:8765
+
+**pip:**
+
+```bash
+python -m pip install livegrab
+```
+
+On macOS and Linux, use `python3 -m pip install livegrab`. Then run the same `livegrab` command.
+
+A git checkout can still use `livegrab.bat` and `livegrab.sh`.
+
+## Windows
+
+Double-click `livegrab.bat`, or from this folder run:
+
+```bat
+py livegrab.py
+```
+
+or:
+
+```bat
+python livegrab.py
+```
+
+Then open http://127.0.0.1:8765
+
+## macOS
+
+From this folder run:
+
+```bash
+./livegrab.sh
+```
+
+or:
 
 ```bash
 python3 livegrab.py
 ```
 
-Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
+Then open http://127.0.0.1:8765
 
-## Defaults
+## Linux
 
-- **Folder:** `~/Videos/Livegrab`
-- **Filename:** `%(title)s [%(id)s].%(ext)s`
-- **Audio:** From the start
-
-Finished files land in the folder above, named from the title and the video id. **From the start** rewinds a livestream to the beginning. On Twitch, that copy already has copyrighted music removed. **Live player audio** keeps the mix you hear in the player, including music, and starts from the current moment.
-
-## Folder and filename
-
-Change the folder and the filename in the form on the page before you press **Start grab**.
-
-- Under **Destination**, edit the **Folder** field. That path is the directory yt-dlp writes into. The default is `~/Videos/Livegrab`. Use another directory when you want these grabs kept separate from other video folders.
-- Under **Filename**, pick a preset or edit the **Template** field. That value is the yt-dlp output template. The default is `%(title)s [%(id)s].%(ext)s`. `%(title)s`, `%(id)s`, and `%(ext)s` are filled in by yt-dlp. The line under the field shows the exact template that will be sent.
-
-The folder, the filename template, and the audio choice are stored in the settings file `~/.config/livegrab/config.json` and reused the next time you open the page.
-
-## One grab per URL
-
-Do not start a second download of a URL that is already running. If that URL is already in progress, leave the running grab alone instead of submitting it again.
-
-## What Livegrab will not touch
-
-The current H3 grab in `~/Videos/Tartube_videos` is external. Leave it alone. Livegrab did not start it, and nothing in this page should stop, move, or rewrite that download.
-
-Files whose names end in `.part` are unfinished. They are still downloading or were interrupted before yt-dlp finished them.
-
-**Stop** only stops grabs Livegrab itself started. It does not stop yt-dlp processes that Tartube or anything else started, including the H3 grab in `~/Videos/Tartube_videos`.
-
-## Tests
-
-From `/home/random/Projects/livegrab`:
+From this folder run:
 
 ```bash
-python3 -m unittest tests.test_command tests.test_progress
+./livegrab.sh
 ```
 
-`tests/test_command.py` checks the yt-dlp argument list. `tests/test_progress.py` checks progress-line parsing. A download line with no numeric stream prefix is treated as the video stream.
+or:
+
+```bash
+python3 livegrab.py
+```
+
+Then open http://127.0.0.1:8765
+
+## First run
+
+The folder field is empty. Type a full folder path before starting a grab. Livegrab does not pick a folder for you.
+
+Examples only:
+
+- Windows: `C:\Users\you\Videos\Livegrab`
+- macOS: `/Users/you/Movies`
+- Linux: `/home/you/Videos`
+
+## Audio
+
+**Live player audio** matches the player and starts now.
+
+**From the start** rewinds. On Twitch that copy already has copyrighted music removed.
+
+Automatic follows always use live player audio.
+
+## Security
+
+The server binds to localhost only (`127.0.0.1`).
