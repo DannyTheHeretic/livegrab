@@ -14,18 +14,18 @@ The Windows installer and the Debian package bring yt-dlp and ffmpeg in with the
 
 ## Downloads
 
-- [Livegrab-Setup.exe](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.0/Livegrab-Setup.exe). The Windows setup includes Livegrab, yt-dlp, and ffmpeg.
-- [livegrab_0.1.0_all.deb](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.0/livegrab_0.1.0_all.deb). The Debian package depends on python3, ffmpeg, and yt-dlp.
+- [Livegrab-Setup.exe](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.1/Livegrab-Setup.exe). The Windows setup includes Livegrab, yt-dlp, and ffmpeg.
+- [livegrab_0.1.1_all.deb](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.1/livegrab_0.1.1_all.deb). The Debian package depends on python3, ffmpeg, and yt-dlp.
 
-The release page is https://github.com/Unaware-Kerbin/livegrab/releases/tag/v0.1.0.
+The release page is https://github.com/Unaware-Kerbin/livegrab/releases/tag/v0.1.1.
 
 `pip` and `pipx` remain an alternative once the PyPI package is published.
 
 ## Installer
 
-**Windows:** [Livegrab-Setup.exe](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.0/Livegrab-Setup.exe) installs the app, yt-dlp, and ffmpeg into one folder. It does not need Python, pip, yt-dlp, or ffmpeg to be installed already. Python is inside the application.
+**Windows:** [Livegrab-Setup.exe](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.1/Livegrab-Setup.exe) installs the app, yt-dlp, and ffmpeg into one folder. It does not need Python, pip, yt-dlp, or ffmpeg to be installed already. Python is inside the application.
 
-**Debian and Ubuntu:** [livegrab_0.1.0_all.deb](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.0/livegrab_0.1.0_all.deb) depends on python3, ffmpeg, and yt-dlp. After downloading it, `sudo apt install ./livegrab_0.1.0_all.deb` installs Livegrab plus those packages. A package built in this tree is `sudo apt install ./dist/livegrab_0.1.0_all.deb`.
+**Debian and Ubuntu:** [livegrab_0.1.1_all.deb](https://github.com/Unaware-Kerbin/livegrab/releases/download/v0.1.1/livegrab_0.1.1_all.deb) depends on python3, ffmpeg, and yt-dlp. After downloading it, `sudo apt install ./livegrab_0.1.1_all.deb` installs Livegrab plus those packages. A package built in this tree is `sudo apt install ./dist/livegrab_0.1.1_all.deb`.
 
 **Linux folder:** `packaging/build-linux-bundle.sh` downloads a static ffmpeg (and ffprobe) and the yt-dlp Linux binary into `dist/livegrab-linux/`, with a launcher that puts those binaries first on `PATH`.
 
