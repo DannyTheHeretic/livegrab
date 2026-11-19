@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Livegrab</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="page">
+    <header class="mast">
+      <h1>Livegrab</h1>
+      <p>It uses the yt-dlp already installed on this computer.</p>
+    </header>
+
+    <form id="grab-form" class="panel" novalidate>
+      <div class="field">
+        <label for="url">URL</label>
+        <div class="url-row">
+          <input id="url" name="url" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://">
+          <button id="start" type="submit">Start grab</button>
+        </div>
+      </div>
+
+      <fieldset class="field">
+        <legend>Destination</legend>
+        <div id="destination-choices" class="choices"></div>
+        <label for="destination">Folder</label>
+        <input id="destination" name="destination" type="text" autocomplete="off" spellcheck="false">
+        <p class="hint">Edit this path to use a custom folder.</p>
+      </fieldset>
+
+      <fieldset class="field">
+        <legend>Filename</legend>
+        <div id="template-presets" class="choices"></div>
+        <label for="template">Template</label>
+        <input id="template" name="template" type="text" autocomplete="off" spellcheck="false">
+        <p class="hint">Exact template sent: <code id="template-exact"></code></p>
+      </fieldset>
+
+      <fieldset class="field">
+        <legend>Recording</legend>
+        <div class="sources" role="radiogroup" aria-label="Recording source">
+          <label class="source" for="live">
+            <input id="live" type="radio" name="audio_source" value="live">
+            <span>Live player audio</span>
+          </label>
+          <label class="source" for="rewind">
+            <input id="rewind" type="radio" name="audio_source" value="rewind" checked>
+            <span>From the start</span>
+          </label>
+        </div>
+        <p class="hint" id="audio-help">Rewinds to the beginning. On Twitch, this is the copy where copyrighted music is already removed.</p>
+        <p class="consequence" id="audio-consequence">Starts from the beginning.</p>
+      </fieldset>
+
+      <p id="settings-note" class="note" role="status"></p>
+      <p id="form-status" class="status" role="status"></p>
+    </form>
+
+    <section class="follows-section" aria-labelledby="follows-heading">
+      <h2 id="follows-heading">Followed channels</h2>
+      <form id="follow-form" novalidate>
+        <div class="field">
+          <label for="follow-channel">Channel</label>
+          <div class="url-row">
+            <input id="follow-channel" name="channel" type="text" autocomplete="off" spellcheck="false" placeholder="Channel name or Twitch URL">
+            <button id="follow-add" type="submit">Add</button>
+          </div>
+        </div>
+      </form>
+      <p class="hint">When a channel goes live, the automatic grab uses live player audio (what you hear, starting when the channel is found live), not the rewindable Twitch copy.</p>
+      <p id="follow-status" class="status" role="status"></p>
+      <div id="follows" class="follows"></div>
+    </section>
+
+    <section class="jobs-section" aria-labelledby="jobs-heading">
+      <h2 id="jobs-heading">Jobs</h2>
+      <div id="jobs" class="jobs"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
