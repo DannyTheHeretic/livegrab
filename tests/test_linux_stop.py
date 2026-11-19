@@ -1,8 +1,9 @@
 """POSIX stop: signal the yt-dlp session, then make sure it is gone.
 
 The fake yt-dlp prints a live progress line with no percentage, writes a
-.part file, and ignores SIGINT and SIGTERM. Stop has to SIGKILL the group
-or the fake and its child stay alive. Nothing here downloads a stream.
+.part file, and ignores SIGINT and SIGTERM. Stop waits out the remux grace,
+then SIGKILL the group. The partial is not media, so it stays a .part.
+Nothing here downloads a stream.
 """
 
 import os
@@ -15,7 +16,13 @@ import unittest
 import uuid
 from pathlib import Path
 
-from livegrab_lib.jobs import JobManager, _popen_kwargs, pid_alive
+from livegrab_lib.jobs import (
+    JobManager,
+    _POSIX_STOP_GRACE,
+    _POSIX_STOP_KILL_WAIT,
+    _popen_kwargs,
+    pid_alive,
+)
 from livegrab_lib.progress import parse_progress_line
 
 LIVE_LINE = "[download]    1.23MiB at  Unknown B/s (00:00:04) (frag 4)"
@@ -230,7 +237,10 @@ class LinuxStopTests(unittest.TestCase):
                 status, body = manager.stop_job(started["id"])
                 elapsed = time.monotonic() - began
                 self.assertEqual(status, 200)
-                self.assertLess(elapsed, 5.0)
+                # The fake never exits on SIGINT, so Stop uses the full grace
+                # before SIGKILL. Two seconds would cut off a real remux.
+                self.assertGreater(elapsed, 20.0)
+                self.assertLess(elapsed, _POSIX_STOP_GRACE + _POSIX_STOP_KILL_WAIT + 10.0)
                 self.assertEqual(body["state"], "stopped")
                 self.assertEqual(body["id"], started["id"])
                 self.assertTrue(body.get("output_path"))

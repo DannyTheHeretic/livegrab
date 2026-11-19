@@ -1,11 +1,18 @@
 """In-memory grab jobs, persisted to jobs.json.
 
 On POSIX, yt-dlp is spawned in its own session so Stop can signal ffmpeg
-with it. Stop sends SIGINT to that group first, waits briefly so yt-dlp can
-finish a partial file, then SIGKILL if the group is still alive. A PID
-Livegrab did not spawn is never signaled, including an already-running
-external grab. On Windows, Stop breaks the hidden process group when that
-does not open a console, then ``taskkill /F /T`` removes whatever remains.
+with it. Stop sends SIGINT to that group first and waits up to about 30
+seconds so yt-dlp can merge and remux. A process that is still exiting on
+its own is not force-killed during that window, including while the
+recording is still making progress toward a finished file. SIGKILL follows
+only if the group is still alive at the deadline. On Windows, Stop breaks
+the hidden process group when that does not open a console, waits the same
+way, then ``taskkill /F /T`` removes whatever remains.
+
+If the recording is still a ``.part``, ``.ytdl``, or ``.temp`` file after
+the process is gone, Stop remuxes it to the intended ``.mp4`` with ffmpeg.
+A PID Livegrab did not spawn is never signaled, including an already-running
+external grab.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from pathlib import Path
 
 from livegrab_lib.command import build_args
 from livegrab_lib.config import ensure_destination, load_config
-from livegrab_lib.platform import config_dir, subprocess_kwargs
+from livegrab_lib.platform import config_dir, ffmpeg_path, subprocess_kwargs
 from livegrab_lib.platform import ytdlp_path as platform_ytdlp_path
 from livegrab_lib.progress import parse_progress_line
 
@@ -36,13 +43,18 @@ ACTIVE_STATES = {"starting", "downloading", "merging", "external"}
 RUNNING_STATES = {"starting", "downloading", "merging"}
 # Historical pid. Never signal it.
 NEVER_SIGNAL_PIDS = {149396}
-# POSIX stop: let yt-dlp finish a partial file, then force the group down.
-_POSIX_STOP_GRACE = 2.0
+# Two seconds is not enough for yt-dlp to merge and remux a live grab.
+# Wait this long after the graceful signal. Force-kill only at the deadline.
+_STOP_GRACE = 30.0
+# POSIX stop: SIGINT, wait for a clean remux, then SIGKILL the group.
+_POSIX_STOP_GRACE = _STOP_GRACE
 _POSIX_STOP_POLL = 0.1
 _POSIX_STOP_KILL_WAIT = 1.0
-# Windows stop: same grace after a hidden break, then always taskkill the tree.
-_WINDOWS_STOP_GRACE = 2.0
+# Windows stop: CTRL_BREAK when it can be delivered, same grace, then taskkill.
+_WINDOWS_STOP_GRACE = _STOP_GRACE
 _WINDOWS_STOP_POLL = 0.1
+_WINDOWS_STOP_KILL_WAIT = 2.0
+_PARTIAL_SUFFIXES = (".part", ".ytdl", ".temp")
 FOLDER_REQUIRED = "Choose a folder before starting"
 FOLDER_UNCREATABLE = "Could not create that folder"
 
@@ -683,6 +695,7 @@ class JobManager:
         self._spawned: set[int] = set()
         self._stop_requested: set[str] = set()
         self._hard_merged: set[str] = set()
+        self._remux_done: set[str] = set()
         self._load()
 
     def list_jobs(self) -> list[dict]:
@@ -798,10 +811,11 @@ class JobManager:
             job["state"] = "stopped"
             _remember_output(job)
             self._save_locked()
+            watched = job
         if pid in NEVER_SIGNAL_PIDS:
             return 409, {"error": "Livegrab will not stop a download it did not start"}
         try:
-            _signal_spawned(pid)
+            _signal_spawned(pid, lambda: _output_signature(watched))
         except ProcessLookupError:
             pass
         except (PermissionError, OSError):
@@ -817,7 +831,7 @@ class JobManager:
             if job is None:
                 return 404, {"error": "job not found"}
             job["state"] = "stopped"
-            _remember_output(job)
+            self._finalize_stopped_locked(job)
             self._save_locked()
             return 200, public_job(job)
 
@@ -937,6 +951,17 @@ class JobManager:
             job["state"] = "error"
             job["error"] = parsed.get("message") or "yt-dlp reported an error"
 
+    def _finalize_stopped_locked(self, job: dict) -> None:
+        """Remux a leftover partial once. Caller holds ``self._lock``."""
+        job_id = job.get("id")
+        if isinstance(job_id, str) and job_id in self._remux_done:
+            if not _is_ready_mp4(job.get("output_path")):
+                _remember_output(job)
+            return
+        if isinstance(job_id, str):
+            self._remux_done.add(job_id)
+        _finalize_partial(job)
+
     def _on_exit(self, job_id: str, rc: int) -> None:
         with self._lock:
             job = self._find(job_id)
@@ -945,7 +970,8 @@ class JobManager:
             pid = job.get("pid")
             if isinstance(pid, int):
                 self._spawned.discard(pid)
-            if job_id in self._stop_requested:
+            stopped = job_id in self._stop_requested
+            if stopped:
                 job["state"] = "stopped"
             elif isinstance(rc, int) and rc < 0:
                 job["state"] = "interrupted"
@@ -955,7 +981,10 @@ class JobManager:
                 job["state"] = "error"
                 if not job.get("error"):
                     job["error"] = f"yt-dlp exited with status {rc}"
-            _remember_output(job)
+            if stopped:
+                self._finalize_stopped_locked(job)
+            else:
+                _remember_output(job)
             self._save_locked()
 
     def _load(self) -> None:
@@ -1020,37 +1049,41 @@ def _popen_kwargs() -> dict:
     return kwargs
 
 
-def _signal_spawned(pid: int) -> None:
+def _signal_spawned(pid: int, progress=None) -> None:
     """Stop a process this app spawned.
 
     Windows hides the console, breaks that process group when it can do so
-    without opening a window, then ``taskkill /F /T`` removes the parent and
-    every child that is still recording. POSIX sends SIGINT to its session so
-    yt-dlp can finish a partial file, waits briefly, then SIGKILL the group
-    if anything is still alive.
+    without opening a window, waits for yt-dlp to merge and remux, then
+    ``taskkill /F /T`` removes the parent and every child that is still
+    recording. POSIX sends SIGINT to its session, waits the same way, then
+    SIGKILL the group if anything is still alive. ``progress`` is polled
+    during the grace window. A changing recording is progress toward exit
+    and is never a reason to force-kill before the deadline.
     """
     number = int(pid)
     if number in NEVER_SIGNAL_PIDS or number <= 0:
         raise PermissionError("refusing to signal this pid")
     if sys.platform == "win32":
-        _signal_spawned_windows(number)
+        _signal_spawned_windows(number, progress)
         return
-    _signal_spawned_posix(number)
+    _signal_spawned_posix(number, progress)
 
 
-def _signal_spawned_windows(pid: int) -> None:
+def _signal_spawned_windows(pid: int, progress=None) -> None:
     """Kill a Windows yt-dlp tree without opening a cmd window.
 
     ``os.kill(..., SIGTERM)`` ends only the parent. The ffmpeg or sleeper
     child keeps recording. A break is attempted first, and only through the
-    process that was already started hidden. Then ``taskkill /F /T /PID``
+    process that was already started hidden. When the break is delivered,
+    Stop waits for yt-dlp to exit on its own. Then ``taskkill /F /T /PID``
     force-kills that pid and its descendants. The parent is still the
     taskkill target when the break could not be delivered, which is the
     usual case with ``CREATE_NO_WINDOW``.
     """
     if _windows_ctrl_break(pid):
-        _wait_pid_exit(pid, _WINDOWS_STOP_GRACE)
+        _wait_pid_exit(pid, _WINDOWS_STOP_GRACE, progress)
     _windows_taskkill_tree(pid)
+    _wait_pid_exit(pid, _WINDOWS_STOP_KILL_WAIT)
 
 
 def _windows_ctrl_break(pid: int) -> bool:
@@ -1080,20 +1113,18 @@ def _windows_taskkill_tree(pid: int) -> None:
     subprocess.run(command, **kwargs)
 
 
-def _wait_pid_exit(pid: int, timeout: float) -> bool:
-    deadline = time.monotonic() + max(0.0, timeout)
-    while True:
-        if not pid_alive(pid):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(_WINDOWS_STOP_POLL, remaining))
+def _wait_pid_exit(pid: int, timeout: float, progress=None) -> bool:
+    return _wait_while_exiting(
+        lambda: pid_alive(pid),
+        timeout,
+        _WINDOWS_STOP_POLL,
+        progress,
+    )
 
 
-def _signal_spawned_posix(pid: int) -> None:
+def _signal_spawned_posix(pid: int, progress=None) -> None:
     _kill_process_group(pid, signal.SIGINT)
-    if _wait_for_group_exit(pid, _POSIX_STOP_GRACE):
+    if _wait_for_group_exit(pid, _POSIX_STOP_GRACE, progress):
         return
     _kill_process_group(pid, signal.SIGKILL)
     _wait_for_group_exit(pid, _POSIX_STOP_KILL_WAIT)
@@ -1106,15 +1137,45 @@ def _kill_process_group(pid: int, sig: int) -> None:
         return
 
 
-def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
+def _wait_for_group_exit(pgid: int, timeout: float, progress=None) -> bool:
+    return _wait_while_exiting(
+        lambda: _group_has_live_members(pgid),
+        timeout,
+        _POSIX_STOP_POLL,
+        progress,
+    )
+
+
+def _wait_while_exiting(still_alive, timeout: float, poll: float, progress=None) -> bool:
+    """Wait until the process is gone, or until ``timeout`` seconds pass.
+
+    Returns True when it has exited. Force-kill is the caller's job and
+    only after this returns False. While the deadline has not been reached,
+    progress toward a finished file does not end the wait early with a kill.
+    """
     deadline = time.monotonic() + max(0.0, timeout)
+    previous = _call_progress(progress)
     while True:
-        if not _group_has_live_members(pgid):
+        if not still_alive():
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        time.sleep(min(_POSIX_STOP_POLL, remaining))
+        current = _call_progress(progress)
+        if current != previous:
+            # The recording is still moving (partial growing, mp4 appearing).
+            # That is progress toward exit. Do not force-kill in this window.
+            previous = current
+        time.sleep(min(poll, remaining))
+
+
+def _call_progress(progress):
+    if progress is None:
+        return None
+    try:
+        return progress()
+    except Exception:
+        return None
 
 
 def _group_has_live_members(pgid: int) -> bool:
@@ -1165,12 +1226,19 @@ def _locate_output(job: dict) -> str | None:
     recorded = job.get("output_path")
     if isinstance(recorded, str) and recorded.strip():
         recorded_path = recorded.strip()
+        ready = _ready_mp4_near(Path(recorded_path))
+        if ready is not None:
+            return str(ready)
         if os.path.isfile(recorded_path):
             return recorded_path
-        part = recorded_path if recorded_path.endswith(".part") else recorded_path + ".part"
+        part = (
+            recorded_path
+            if recorded_path.casefold().endswith(".part")
+            else recorded_path + ".part"
+        )
         if os.path.isfile(part):
             return part
-        if recorded_path.endswith(".part"):
+        if recorded_path.casefold().endswith(".part"):
             finished = recorded_path[: -len(".part")]
             if finished and os.path.isfile(finished):
                 return finished
@@ -1191,15 +1259,406 @@ def _locate_output(job: dict) -> str | None:
             continue
         if started is not None and mtime < started - 2:
             continue
-        if started is None and not entry.name.endswith(".part"):
+        if started is None and not _is_partial_name(entry.name):
             continue
         fresh.append((mtime, entry))
     if not fresh:
         return None
-    parts = [item for item in fresh if item[1].name.endswith(".part")]
-    pool = parts or fresh
+    finished = [item for item in fresh if _is_ready_mp4_path(item[1])]
+    partials = [item for item in fresh if _is_partial_name(item[1].name)]
+    media = [
+        item
+        for item in partials
+        if not item[1].name.casefold().endswith(".ytdl")
+    ]
+    if finished:
+        pool = finished
+    elif media:
+        pool = media
+    elif partials:
+        pool = partials
+    else:
+        pool = fresh
     pool.sort(key=lambda item: item[0])
     return str(pool[-1][1])
+
+
+def _output_signature(job: dict):
+    """Fingerprint the recording files. A change is progress toward exit."""
+    paths = []
+    recorded = job.get("output_path")
+    if isinstance(recorded, str) and recorded.strip():
+        paths.append(recorded.strip())
+    destination = job.get("destination")
+    if isinstance(destination, str) and destination.strip():
+        try:
+            for entry in Path(destination).iterdir():
+                if entry.is_file():
+                    paths.append(str(entry))
+        except OSError:
+            pass
+    signature = []
+    seen = set()
+    for text in paths:
+        if text in seen:
+            continue
+        seen.add(text)
+        try:
+            st = os.stat(text)
+        except OSError:
+            signature.append((text, None))
+            continue
+        signature.append((text, st.st_size, getattr(st, "st_mtime_ns", st.st_mtime)))
+    signature.sort()
+    return tuple(signature)
+
+
+def _finalize_partial(job: dict) -> None:
+    """Turn a leftover partial into the intended mp4 after the process is gone."""
+    try:
+        _finalize_partial_work(job)
+    except OSError as exc:
+        if not job.get("error"):
+            job["error"] = "Could not remux the partial recording: %s" % exc
+        if not _is_ready_mp4(job.get("output_path")):
+            _remember_output(job)
+
+
+def _finalize_partial_work(job: dict) -> None:
+    partial = _find_partial_media(job)
+    if partial is None:
+        ready = _find_ready_output(job)
+        if ready is not None:
+            job["output_path"] = str(ready)
+            return
+        _remember_output(job)
+        located = job.get("output_path")
+        if isinstance(located, str) and _is_partial_name(os.path.basename(located)):
+            if not job.get("error"):
+                job["error"] = (
+                    "Partial recording was left in place; no media file could be remuxed"
+                )
+        return
+    final = _intended_mp4(partial)
+    if os.path.normcase(str(final)) == os.path.normcase(str(partial)):
+        job["output_path"] = str(partial)
+        job["error"] = "Could not choose an mp4 path for the partial recording"
+        return
+    if _file_size(final) > 0:
+        job["output_path"] = str(final)
+        _delete_partial_after_success(partial, final)
+        return
+    if _file_size(partial) <= 0:
+        job["output_path"] = str(partial)
+        job["error"] = "Partial recording is empty; left it in place"
+        return
+    binary = ffmpeg_path()
+    if not binary:
+        job["output_path"] = str(partial)
+        job["error"] = "ffmpeg was not found; partial recording was left in place"
+        return
+    error = _remux_partial(binary, partial, final)
+    if error is None and _file_size(final) > 0:
+        job["output_path"] = str(final)
+        _delete_partial_after_success(partial, final)
+        return
+    _unlink_quiet(final)
+    job["output_path"] = str(partial)
+    job["error"] = error or "Could not remux the partial recording"
+
+
+def _find_ready_output(job: dict) -> Path | None:
+    recorded = job.get("output_path")
+    if isinstance(recorded, str) and recorded.strip():
+        ready = _ready_mp4_near(Path(recorded.strip()))
+        if ready is not None:
+            return ready
+    located = _locate_output(job)
+    if located:
+        ready = _ready_mp4_near(Path(located))
+        if ready is not None:
+            return ready
+    return None
+
+
+def _find_partial_media(job: dict) -> Path | None:
+    candidates = []
+    recorded = job.get("output_path")
+    if isinstance(recorded, str) and recorded.strip():
+        candidates.append(Path(recorded.strip()))
+    located = _locate_output(job)
+    if located:
+        candidates.append(Path(located))
+    candidates.extend(_recent_partials(job))
+    media = []
+    seen = set()
+    for candidate in candidates:
+        for path in _media_variants(candidate):
+            key = os.path.normcase(str(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            if path.is_file() and _is_media_partial(path):
+                media.append(path)
+    if not media:
+        return None
+
+    def sort_key(path: Path):
+        name = path.name.casefold()
+        size = _file_size(path)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        return (not name.endswith(".part"), -size, -mtime)
+
+    media.sort(key=sort_key)
+    return media[0]
+
+
+def _recent_partials(job: dict) -> list[Path]:
+    destination = job.get("destination")
+    if not isinstance(destination, str) or not destination.strip():
+        return []
+    started = _started_timestamp(job.get("started_at"))
+    found = []
+    try:
+        entries = list(Path(destination).iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_file() or not _is_partial_name(entry.name):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if started is not None and mtime < started - 2:
+            continue
+        found.append(entry)
+    return found
+
+
+def _media_variants(path: Path):
+    name = path.name.casefold()
+    if name.endswith(".ytdl"):
+        base = str(path)[: -len(".ytdl")]
+        yield Path(base + ".part")
+        yield Path(base + ".temp")
+        return
+    if name.endswith(".part") or name.endswith(".temp"):
+        yield path
+        return
+    yield Path(str(path) + ".part")
+    yield Path(str(path) + ".temp")
+
+
+def _remux_partial(ffmpeg: str, partial: Path, final: Path) -> str | None:
+    """Return None when ``final`` is a non-empty mp4. Otherwise an error string.
+
+    A clean exit is the normal success. A stopped live stream is often
+    truncated, so ffmpeg can also exit non-zero after writing a real mp4.
+    That file is kept when it has an ``ftyp`` header and a size above zero.
+    MPEG-TS inputs get one retry with the AAC bitstream filter when the
+    first copy does not exit cleanly.
+    """
+    mpegts = _looks_like_mpegts(partial)
+    filters = [False]
+    if mpegts:
+        filters.append(True)
+    errors = []
+    stash = final.with_name(final.name + ".livegrab-stash")
+    _unlink_quiet(stash)
+    try:
+        for index, bitstream_filter in enumerate(filters):
+            _unlink_quiet(final)
+            result = _run_ffmpeg(
+                _ffmpeg_command(ffmpeg, partial, final, bitstream_filter)
+            )
+            if _ffmpeg_succeeded(result, final):
+                _unlink_quiet(stash)
+                return None
+            if _file_size(final) > 0 and _has_ftyp(final):
+                _unlink_quiet(stash)
+                os.replace(final, stash)
+            else:
+                _unlink_quiet(final)
+            errors.append(_ffmpeg_failure_text(result))
+            if index == 0 and not mpegts:
+                break
+        if _file_size(stash) > 0:
+            os.replace(stash, final)
+            return None
+    finally:
+        _unlink_quiet(stash)
+    return "; ".join(error for error in errors if error) or "ffmpeg remux failed"
+
+
+def _ffmpeg_command(ffmpeg: str, partial: Path, final: Path, bitstream_filter: bool) -> list[str]:
+    command = [ffmpeg, "-y", "-i", str(partial), "-c", "copy"]
+    if bitstream_filter:
+        command.extend(["-bsf:a", "aac_adtstoasc"])
+    command.extend(["-movflags", "+faststart", str(final)])
+    return command
+
+
+def _run_ffmpeg(command: list[str]):
+    """Run ffmpeg. On Windows the console stays hidden, same as yt-dlp."""
+    kwargs = subprocess_kwargs()
+    kwargs["stdin"] = subprocess.DEVNULL
+    kwargs["stdout"] = subprocess.PIPE
+    kwargs["stderr"] = subprocess.PIPE
+    kwargs["shell"] = False
+    kwargs["check"] = False
+    kwargs["text"] = True
+    kwargs["encoding"] = "utf-8"
+    kwargs["errors"] = "replace"
+    return subprocess.run(command, **kwargs)
+
+
+def _ffmpeg_succeeded(result, final: Path) -> bool:
+    if result is None or getattr(result, "returncode", 1) != 0:
+        return False
+    return _file_size(final) > 0
+
+
+def _has_ftyp(path: Path) -> bool:
+    """True when the file starts like an MPEG-4 container."""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(64)
+    except OSError:
+        return False
+    return b"ftyp" in header
+
+
+def _ffmpeg_failure_text(result) -> str:
+    if result is None:
+        return "ffmpeg remux failed"
+    code = getattr(result, "returncode", 1)
+    err = getattr(result, "stderr", "") or ""
+    out = getattr(result, "stdout", "") or ""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    if not isinstance(err, str):
+        err = str(err)
+    if not isinstance(out, str):
+        out = str(out)
+    detail = (err or out).strip()
+    if not detail:
+        return "ffmpeg remux failed (%s)" % code
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    detail = " | ".join(lines[-4:])
+    if len(detail) > 400:
+        detail = detail[-400:]
+    return "ffmpeg remux failed (%s): %s" % (code, detail)
+
+
+def _looks_like_mpegts(path: Path) -> bool:
+    base = _strip_partial_suffix(path.name)
+    if base.casefold().endswith(".ts"):
+        return True
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read(188 * 64)
+    except OSError:
+        return False
+    if len(blob) < 188:
+        return False
+    limit = min(len(blob) - 188, 188 * 8)
+    for offset in range(limit + 1):
+        if blob[offset] != 0x47 or blob[offset + 188] != 0x47:
+            continue
+        if offset + 376 < len(blob) and blob[offset + 376] != 0x47:
+            continue
+        return True
+    return False
+
+
+def _delete_partial_after_success(partial: Path, final: Path) -> None:
+    """Delete the partial only after the mp4 exists and is non-empty."""
+    if not _is_media_partial(partial):
+        return
+    if _file_size(final) <= 0:
+        return
+    if os.path.normcase(str(partial)) == os.path.normcase(str(final)):
+        return
+    _unlink_quiet(partial)
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        return
+
+
+def _is_partial_name(name: str) -> bool:
+    if not isinstance(name, str) or not name:
+        return False
+    lowered = name.casefold()
+    return any(lowered.endswith(suffix) for suffix in _PARTIAL_SUFFIXES)
+
+
+def _is_media_partial(path: Path) -> bool:
+    name = path.name.casefold()
+    return name.endswith(".part") or name.endswith(".temp")
+
+
+def _strip_partial_suffix(name: str) -> str:
+    lowered = name.casefold()
+    for suffix in _PARTIAL_SUFFIXES:
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _intended_mp4(partial: Path) -> Path:
+    base = _strip_partial_suffix(partial.name)
+    if not base:
+        base = partial.name + ".mp4"
+    intended = partial.with_name(base)
+    if intended.suffix.casefold() != ".mp4":
+        intended = intended.with_suffix(".mp4")
+    if intended.name.casefold() == partial.name.casefold():
+        intended = partial.with_name(base + ".mp4")
+    return intended
+
+
+def _ready_mp4_near(path: Path) -> Path | None:
+    if _is_ready_mp4_path(path):
+        return path
+    if _is_partial_name(path.name):
+        final = _intended_mp4(path)
+        if _is_ready_mp4_path(final):
+            return final
+    return None
+
+
+def _is_ready_mp4(path) -> bool:
+    if not isinstance(path, str) or not path.strip():
+        return False
+    return _is_ready_mp4_path(Path(path.strip()))
+
+
+def _is_ready_mp4_path(path: Path) -> bool:
+    if _is_partial_name(path.name):
+        return False
+    if path.suffix.casefold() != ".mp4":
+        return False
+    return _file_size(path) > 0
+
+
+def _file_size(path: Path) -> int:
+    try:
+        if path.is_file():
+            return path.stat().st_size
+    except OSError:
+        return 0
+    return 0
 
 
 def _started_timestamp(value) -> float | None:

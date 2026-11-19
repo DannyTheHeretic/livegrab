@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from livegrab_lib.config import config_view, update_config
 from livegrab_lib.follows import FollowChecker, FollowError
-from livegrab_lib.jobs import JobError, JobManager
+from livegrab_lib.jobs import RUNNING_STATES, JobError, JobManager
 from livegrab_lib.platform import ffmpeg_path, ytdlp_path
 
 HOST = "127.0.0.1"
 PORTS = (8765,)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_BODY = 1_000_000
+# Let the shutdown response leave the socket before this process ends.
+_SHUTDOWN_FLUSH_SECONDS = 0.5
+
+log = logging.getLogger("livegrab")
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -28,6 +36,56 @@ _MIME = {
     ".ico": "image/x-icon",
     ".txt": "text/plain; charset=utf-8",
 }
+
+
+def stop_running_jobs(manager) -> None:
+    """Stop each running grab. One failure is logged and does not skip the rest."""
+    if manager is None:
+        return
+    try:
+        jobs = list(manager.list_jobs())
+    except Exception:
+        log.exception("Livegrab shutdown could not list jobs")
+        return
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("state") not in RUNNING_STATES:
+            continue
+        job_id = job.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        try:
+            manager.stop_job(job_id)
+        except Exception:
+            log.exception("Livegrab shutdown failed to stop job %s", job_id)
+
+
+def exit_process(server) -> None:
+    """Stop the HTTP server, then end this Livegrab process.
+
+    ``os._exit`` ends the Windows console and the Linux process. It does
+    not signal any other process.
+    """
+    try:
+        server.shutdown()
+    except Exception:
+        log.exception("Livegrab could not shut down the HTTP server")
+    try:
+        server.server_close()
+    except Exception:
+        log.exception("Livegrab could not close the HTTP server")
+    os._exit(0)
+
+
+def schedule_process_exit(server, delay: float = _SHUTDOWN_FLUSH_SECONDS):
+    """Give the shutdown response time to flush, then exit this process."""
+
+    def _exit() -> None:
+        time.sleep(delay)
+        exit_process(server)
+
+    thread = threading.Thread(target=_exit, name="livegrab-exit", daemon=False)
+    thread.start()
+    return thread
 
 
 class LivegrabServer(ThreadingHTTPServer):
@@ -99,6 +157,9 @@ class LivegrabHandler(BaseHTTPRequestHandler):
 
     def _handle_post(self):
         path = urlparse(self.path).path
+        if path == "/api/shutdown":
+            self._begin_shutdown()
+            return
         if path == "/api/config":
             self._send_json(200, update_config(self._read_json()))
             return
@@ -155,6 +216,19 @@ class LivegrabHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
+    def _begin_shutdown(self) -> None:
+        stop_running_jobs(self.manager)
+        self.close_connection = True
+        try:
+            self._send_json(200, {"ok": True}, close=True)
+            try:
+                self.wfile.flush()
+            except Exception:
+                log.exception("Livegrab could not flush the shutdown response")
+        except Exception:
+            log.exception("Livegrab could not send the shutdown response")
+        schedule_process_exit(self.server)
+
     def _require_manager(self):
         if self.manager is None:
             raise JobError("server is not ready", 500)
@@ -205,15 +279,17 @@ class LivegrabHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(raw.decode("utf-8"))
 
-    def _send_json(self, status: int, payload) -> None:
+    def _send_json(self, status: int, payload, close: bool = False) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8")
+        self._send_bytes(status, body, "application/json; charset=utf-8", close=close)
 
-    def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+    def _send_bytes(self, status: int, body: bytes, content_type: str, close: bool = False) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if close:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 

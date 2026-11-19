@@ -56,6 +56,17 @@ body {
   padding: 2.5rem 0 4rem;
 }
 
+.mast {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.mast-copy {
+  min-width: 0;
+}
+
 .mast h1 {
   margin: 0;
   font-size: 2rem;
@@ -68,6 +79,23 @@ body {
   margin: 0.4rem 0 0;
   color: var(--muted);
   font-size: 1.05rem;
+}
+
+.quit {
+  flex: none;
+  margin-top: 0.15rem;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+  border-radius: 0.7rem;
+  min-height: 2.75rem;
+  padding: 0.45rem 0.95rem;
+  font-weight: 650;
+}
+
+.quit:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .panel,
@@ -445,8 +473,13 @@ button:focus-visible {
     align-items: stretch;
   }
 
+  .mast {
+    flex-direction: column;
+  }
+
   #start,
   #follow-add,
+  .quit,
   .stop,
   .remove {
     width: 100%;

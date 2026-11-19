@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build dist/livegrab_0.1.1_all.deb. ffmpeg and yt-dlp are package dependencies.
+# Build dist/livegrab_0.1.2_all.deb. ffmpeg and yt-dlp are package dependencies.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
@@ -39,5 +39,5 @@ chmod 644 "$STAGE/DEBIAN/control" "$APP/livegrab.py" \
   "$STAGE/usr/share/doc/livegrab/copyright"
 
 mkdir -p "$ROOT/dist"
-dpkg-deb --root-owner-group --build "$STAGE" "$ROOT/dist/livegrab_0.1.1_all.deb"
-echo "wrote $ROOT/dist/livegrab_0.1.1_all.deb"
+dpkg-deb --root-owner-group --build "$STAGE" "$ROOT/dist/livegrab_0.1.2_all.deb"
+echo "wrote $ROOT/dist/livegrab_0.1.2_all.deb"

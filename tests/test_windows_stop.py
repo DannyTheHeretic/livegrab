@@ -74,7 +74,6 @@ class WindowsTreeStopTests(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             self.assertIsInstance(argv, list)
-            self.assertEqual(argv[:4], ["taskkill", "/F", "/T", "/PID"])
             self.assertFalse(kwargs.get("shell", False))
             flags = kwargs.get("creationflags", 0)
             self.assertTrue(flags & _WIN_CREATE_NO_WINDOW)
@@ -82,11 +81,15 @@ class WindowsTreeStopTests(unittest.TestCase):
             info = kwargs["startupinfo"]
             self.assertTrue(info.dwFlags & _WIN_STARTF_USESHOWWINDOW)
             self.assertEqual(info.wShowWindow, _WIN_SW_HIDE)
+            if argv[:4] != ["taskkill", "/F", "/T", "/PID"]:
+                calls.append(("ffmpeg", list(argv)))
+                return mock.Mock(returncode=1, stdout="", stderr="invalid data")
             calls.append(("taskkill", int(argv[4])))
             if "/T" in argv:
                 _drop_tree(int(argv[4]), alive, parent_of)
             else:
                 alive.discard(int(argv[4]))
+            return mock.Mock(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as directory:
             destination = os.path.join(directory, "videos")
@@ -120,6 +123,7 @@ class WindowsTreeStopTests(unittest.TestCase):
                 mock.patch("livegrab_lib.jobs.pid_alive", side_effect=lambda pid: int(pid) in alive),
                 mock.patch("livegrab_lib.jobs.os.kill", side_effect=fake_kill),
                 mock.patch("livegrab_lib.jobs.subprocess.run", side_effect=fake_run),
+                mock.patch("livegrab_lib.jobs.ffmpeg_path", return_value="ffmpeg.exe"),
                 mock.patch("livegrab_lib.jobs._WINDOWS_STOP_GRACE", grace),
             ):
                 status, body = manager.stop_job(job["id"])

@@ -19,6 +19,7 @@
   var followAdd = document.getElementById("follow-add");
   var followStatus = document.getElementById("follow-status");
   var followsEl = document.getElementById("follows");
+  var quitBtn = document.getElementById("quit-livegrab");
 
   var presets = {};
   var saveTimer = null;
@@ -845,6 +846,19 @@
   });
 
   urlInput.addEventListener("input", syncStart);
+
+  if (quitBtn) {
+    quitBtn.addEventListener("click", function () {
+      var confirmed = window.confirm(
+        "Quit Livegrab? Running downloads will be stopped, then Livegrab will exit."
+      );
+      if (!confirmed) return;
+      quitBtn.disabled = true;
+      fetch("/api/shutdown", { method: "POST" }).catch(function () {
+        // The process exits after the response, so the connection may drop.
+      });
+    });
+  }
 
   async function init() {
     syncDestinationNeeded();
