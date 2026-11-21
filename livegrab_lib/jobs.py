@@ -35,7 +35,6 @@ from livegrab_lib.config import ensure_destination, load_config
 from livegrab_lib.platform import config_dir, ffmpeg_path, subprocess_kwargs
 from livegrab_lib.platform import ytdlp_path as platform_ytdlp_path
 from livegrab_lib.progress import parse_progress_line
-from livegrab_lib.server import log
 
 JOBS_PATH = config_dir() / "jobs.json"
 LOG_TAIL = 30
@@ -280,7 +279,7 @@ def _windows_ytdlp_argvs():
         try:
             argv = _windows_command_argv(pid)
         except Exception: # noqa
-            log.debug("Problem with yt-dlp")
+            sys.stderr.write("Problem with yt-dlp on Windows\n")
         if not argv:
             continue
         if not _is_ytdlp(argv):
